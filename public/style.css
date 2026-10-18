@@ -1,3 +1,52 @@
+/* Self-hosted so visitors are not exposed to third-party font requests (SIL OFL 1.1, see /fonts). */
+@font-face {
+  font-family: "DM Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/dm-sans-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "DM Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/dm-sans-latin-500-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "DM Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/dm-sans-latin-600-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "DM Sans";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/dm-sans-latin-700-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "DM Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/dm-mono-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "DM Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/dm-mono-latin-500-normal.woff2") format("woff2");
+}
+
 :root {
   color-scheme: light;
   --canvas: #f6f1f2;
@@ -650,6 +699,12 @@ th:first-child {
   border-color: var(--caution-border);
   background: var(--caution-bg);
   color: var(--caution);
+}
+
+.status-pill.inactive {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--text-tertiary);
 }
 
 .commission {
@@ -1578,6 +1633,72 @@ footer b {
 
   .sort-control select {
     max-width: min(190px, 56vw);
+  }
+}
+
+/* Phones: show each validator as a labelled card instead of a wide table. */
+@media (max-width: 600px) {
+  .table-wrap {
+    overflow-x: visible;
+  }
+
+  table {
+    min-width: 0;
+  }
+
+  thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  #validator-rows tr {
+    position: relative;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  #validator-rows tr:last-child {
+    border-bottom: 0;
+  }
+
+  #validator-rows td {
+    display: block;
+    padding: 0;
+    border: 0;
+    white-space: normal;
+  }
+
+  #validator-rows td[data-label]:not([data-label="Validator"], [data-label="Watch"])::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    color: var(--text-tertiary);
+    font: 500 10px/16px "DM Mono", ui-monospace, monospace;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  #validator-rows td[data-label="Validator"] {
+    grid-column: 1 / -1;
+    padding-right: 44px;
+  }
+
+  #validator-rows td[data-label="Watch"] {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+  }
+
+  #validator-rows td[data-label="Status"],
+  #validator-rows td[data-label="Collectors"],
+  #validator-rows td.empty {
+    grid-column: 1 / -1;
   }
 }
 

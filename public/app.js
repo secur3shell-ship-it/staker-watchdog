@@ -15,6 +15,21 @@ let page = 0;
 let sortBy = "stake";
 let sortDirection = "desc";
 let lastAlertId = Number(localStorage.getItem(lastAlertKey)) || null;
+let lastValidators = null;
+let lastAlerts = null;
+let currentDetail = null;
+let detailRequest = 0;
+let fallbackTimer = null;
+let rateLimitTimer = null;
+let weightRefreshTimer;
+const fallbackPollMs = 120_000;
+
+class RateLimitError extends Error {
+  constructor(retryAfterSeconds) {
+    super("The data API rate limit was reached");
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
 let watchlist = loadStringSet(watchlistKey);
 let preferences = loadPreferences();
 
@@ -33,16 +48,13 @@ const formatStake = (lamports) => {
   } catch {
     return "—";
   }
-  document.querySelector("#commission-threshold").addEventListener("change", (event) => {
-    const value = Number(event.target.value);
-    if (!Number.isSafeInteger(value) || value < 0 || value > 10_000) {
-      event.target.value = preferences.commissionIncreaseThresholdBps;
-      return;
-    }
-    preferences.commissionIncreaseThresholdBps = value;
-    savePreferences();
-  });
 };
+
+const statusClass = (status) =>
+  status === "delinquent" || status === "inactive" ? status : "";
+
+const formatDuration = (seconds) =>
+  seconds < 90 ? `${seconds}s` : `${Math.ceil(seconds / 60)} min`;
 
 const percentage = (bps) =>
   bps === null || bps === undefined ? null : `${(bps / 100).toFixed(bps % 100 ? 2 : 0)}%`;
@@ -57,7 +69,7 @@ function loadStringSet(key) {
 }
 
 function shouldNotifyAlert(alert) {
-  if (!categoryEnabled(alert)) return false;
+  if (!alertIsEnabled(alert)) return false;
   if (!alert.field.includes("commission")) return true;
   const increaseBps = Number(alert.newValue) - Number(alert.previousValue);
   return increaseBps > 0 &&
@@ -111,7 +123,7 @@ function commissionCell(bps, kind, source) {
   }
   const sourceLabel = source === "legacy_migration_default"
     ? kind === "block revenue" ? "protocol migration default" : "legacy commission"
-    : source === "vote_state_v4" ? "on-chain VoteState v4" : kind;
+    : source === "vote_state_v4" ? "on-chain VoteState v4" : source ? kind : "reported by RPC";
   return `<span class="commission">${percentage(bps)}</span><small>${sourceLabel}</small>`;
 }
 
@@ -127,6 +139,7 @@ function collectorCell(inflation, block, source) {
 }
 
 function renderValidators(data, total) {
+  lastValidators = { data, total };
   const start = total ? page * pageSize + 1 : 0;
   const end = Math.min((page + 1) * pageSize, total);
   document.querySelector("#table-count").textContent =
@@ -136,28 +149,51 @@ function renderValidators(data, total) {
   document.querySelector("#previous-page").disabled = page <= 0;
   document.querySelector("#next-page").disabled = end >= total;
   if (!data.length) {
-    rows.innerHTML = `<tr><td colspan="8" class="empty">${
-      selectedStatus === "watchlist" && watchlist.size === 0
-        ? "Your watchlist is empty. Add validators with the star button."
-        : "No validators match this search."
-    }</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="8" class="empty">${emptyDirectoryMessage()}</td></tr>`;
     return;
   }
   rows.innerHTML = data.map((validator) => {
-    const delinquent = validator.status === "delinquent";
     const score = personalizedScore(validator);
     const watched = watchlist.has(validator.votePubkey);
     return `<tr>
-      <td><button class="validator-link" data-detail="${escapeHtml(validator.votePubkey)}">${escapeHtml(shorten(validator.nodePubkey, 8, 7))}</button><span class="validator-key">${escapeHtml(shorten(validator.votePubkey, 8, 7))}</span></td>
-      <td><button class="watch-toggle ${watched ? "watched" : ""}" data-watch="${escapeHtml(validator.votePubkey)}" aria-label="${watched ? "Remove from" : "Add to"} watchlist" title="${watched ? "Remove from" : "Add to"} watchlist">${watched ? "★" : "☆"}</button></td>
-      <td><span class="status-pill ${delinquent ? "delinquent" : ""}">${validator.status}</span></td>
-      <td>${commissionCell(validator.inflationCommissionBps, "inflation rewards", validator.commissionSource)}</td>
-      <td>${commissionCell(validator.blockRevenueCommissionBps, "block revenue", validator.commissionSource)}</td>
-      <td>${collectorCell(validator.inflationCollector, validator.blockRevenueCollector, validator.commissionSource)}</td>
-      <td>${score === null ? '<span class="score-na">—</span>' : `<span class="score">${score.toFixed(1)} / 100</span>`}</td>
-      <td><span class="stake">${formatStake(validator.activeStakeLamports)}</span></td>
+      <td data-label="Validator"><button class="validator-link" data-detail="${escapeHtml(validator.votePubkey)}">${escapeHtml(shorten(validator.nodePubkey, 8, 7))}</button><span class="validator-key">${escapeHtml(shorten(validator.votePubkey, 8, 7))}</span></td>
+      <td data-label="Watch"><button class="watch-toggle ${watched ? "watched" : ""}" data-watch="${escapeHtml(validator.votePubkey)}" aria-label="${watched ? "Remove from" : "Add to"} watchlist" title="${watched ? "Remove from" : "Add to"} watchlist">${watched ? "★" : "☆"}</button></td>
+      <td data-label="Status"><span class="status-pill ${statusClass(validator.status)}">${escapeHtml(validator.status)}</span></td>
+      <td data-label="Inflation commission">${commissionCell(validator.inflationCommissionBps, "inflation rewards", validator.commissionSource)}</td>
+      <td data-label="Block revenue commission">${commissionCell(validator.blockRevenueCommissionBps, "block revenue", validator.commissionSource)}</td>
+      <td data-label="Collectors">${collectorCell(validator.inflationCollector, validator.blockRevenueCollector, validator.commissionSource)}</td>
+      <td data-label="Your score">${score === null ? '<span class="score-na">—</span>' : `<span class="score">${score.toFixed(1)} / 100</span>`}</td>
+      <td data-label="Active stake"><span class="stake">${formatStake(validator.activeStakeLamports)}</span></td>
     </tr>`;
   }).join("");
+}
+
+function emptyDirectoryMessage() {
+  if (search.value.trim()) return "No validators match this search.";
+  if (selectedStatus === "watchlist") {
+    return watchlist.size === 0
+      ? "Your watchlist is empty. Add validators with the star button."
+      : "None of your watched validators are in the current data.";
+  }
+  if (selectedStatus === "inactive") {
+    return "No inactive validators. A validator appears here when it drops out of the network's vote-account list.";
+  }
+  if (selectedStatus === "delinquent") return "No delinquent validators right now.";
+  return "No validators to show yet.";
+}
+
+// One sync can record several event types with identical values; show it once.
+function groupHistory(history) {
+  const groups = [];
+  for (const entry of history) {
+    const previous = groups.at(-1);
+    if (previous && previous.recordedAt === entry.recordedAt && previous.slot === entry.slot) {
+      previous.eventTypes.push(entry.eventType);
+    } else {
+      groups.push({ ...entry, eventTypes: [entry.eventType] });
+    }
+  }
+  return groups;
 }
 
 function formatAlertField(field) {
@@ -185,7 +221,7 @@ function alertIsEnabled(alert) {
 }
 
 function renderAlerts(data, total) {
-  document.querySelector("#change-count").textContent = total.toLocaleString();
+  lastAlerts = { data, total };
   const visible = data.filter((alert) => alertIsEnabled(alert));
   if (!visible.length) {
     alerts.innerHTML = `<div class="empty-alert">${
@@ -199,7 +235,7 @@ function renderAlerts(data, total) {
     <article class="alert-item">
       <time class="alert-time">${new Date(alert.detectedAt).toLocaleString()}</time>
       <button class="alert-validator validator-link" data-detail="${escapeHtml(alert.votePubkey)}">${escapeHtml(shorten(alert.votePubkey, 8, 7))}</button>
-      <span class="alert-kind">${formatAlertField(alert.field)}</span>
+      <span class="alert-kind">${escapeHtml(formatAlertField(alert.field))}</span>
       <span class="alert-values">${formatAlertValue(alert.field, alert.previousValue)} <span class="alert-arrow">→</span> ${formatAlertValue(alert.field, alert.newValue)}</span>
       <span class="alert-time">${escapeHtml(shorten(alert.nodePubkey, 5, 4))}</span>
     </article>`).join("");
@@ -239,12 +275,17 @@ function syncPreferenceControls() {
 function persistWatchlist() {
   localStorage.setItem(watchlistKey, JSON.stringify([...watchlist]));
   updateWatchlistSummary();
-  if (selectedStatus === "watchlist") page = 0;
-  void refresh();
+  // Only server-filtered views need new data; elsewhere just redraw the stars.
+  if (selectedStatus === "watchlist" || preferences.watchlistOnly) {
+    if (selectedStatus === "watchlist") page = 0;
+    void refresh();
+  } else if (lastValidators) {
+    renderValidators(lastValidators.data, lastValidators.total);
+  }
 }
 
 function renderHistoryChart(history) {
-  const points = [...history].reverse().filter((entry) =>
+  const points = groupHistory(history).reverse().filter((entry) =>
     entry.inflationCommissionBps !== null || entry.blockRevenueCommissionBps !== null
   );
   if (!points.length) return '<p class="empty-alert">Commission history will appear as changes are observed.</p>';
@@ -280,22 +321,18 @@ function renderHistoryChart(history) {
     </svg>`;
 }
 
-async function openValidator(votePubkey, updateUrl = true) {
-  try {
-    const encodedKey = encodeURIComponent(votePubkey);
-    const [validatorResponse, historyResponse] = await Promise.all([
-      fetch(`/api/validators/${encodedKey}`),
-      fetch(`/api/validators/${encodedKey}/history?limit=100`)
-    ]);
-    if (!validatorResponse.ok || !historyResponse.ok) {
-      throw new Error("Unable to load validator detail and history");
-    }
-    const [{ data: validator }, { data: validatorHistory }] = await Promise.all([
-      validatorResponse.json(), historyResponse.json()
-    ]);
-    const watched = watchlist.has(votePubkey);
-    const score = personalizedScore(validator);
-    detailSection.innerHTML = `
+function sourceLabel(source, legacyLabel) {
+  if (source === "legacy_migration_default") return legacyLabel;
+  return source === "vote_state_v4" ? "VoteState v4" : "Not identified";
+}
+
+function renderDetail() {
+  if (!currentDetail) return;
+  const { validator, history: validatorHistory } = currentDetail;
+  const votePubkey = validator.votePubkey;
+  const watched = watchlist.has(votePubkey);
+  const score = personalizedScore(validator);
+  detailSection.innerHTML = `
       <div class="detail-heading">
         <div><div class="eyebrow"><span class="eyebrow-line"></span> Validator profile</div><h2>${escapeHtml(shorten(validator.nodePubkey, 10, 9))}</h2></div>
         <button class="outline-button" id="close-detail">Close detail ×</button>
@@ -305,12 +342,12 @@ async function openValidator(votePubkey, updateUrl = true) {
         <div><span>VOTE ACCOUNT</span><code>${escapeHtml(validator.votePubkey)}</code></div>
       </div>
       <div class="detail-grid">
-        <article><span>STATUS</span><strong class="status-pill ${validator.status === "delinquent" ? "delinquent" : ""}">${validator.status}</strong></article>
+        <article><span>STATUS</span><strong class="status-pill ${statusClass(validator.status)}">${escapeHtml(validator.status)}</strong></article>
         <article><span>ACTIVE STAKE</span><strong>${formatStake(validator.activeStakeLamports)}</strong></article>
-        <article><span>INFLATION COMMISSION</span><strong>${percentage(validator.inflationCommissionBps) ?? "Unknown"}</strong><small>${validator.commissionSource === "legacy_migration_default" ? "Legacy commission" : "VoteState v4"}</small></article>
-        <article><span>BLOCK REVENUE COMMISSION</span><strong>${percentage(validator.blockRevenueCommissionBps) ?? "Unknown"}</strong><small>${validator.commissionSource === "legacy_migration_default" ? "Protocol migration default" : "VoteState v4"}</small></article>
+        <article><span>INFLATION COMMISSION</span><strong>${percentage(validator.inflationCommissionBps) ?? "Unknown"}</strong><small>${sourceLabel(validator.commissionSource, "Legacy commission")}</small></article>
+        <article><span>BLOCK REVENUE COMMISSION</span><strong>${percentage(validator.blockRevenueCommissionBps) ?? "Unknown"}</strong><small>${sourceLabel(validator.commissionSource, "Protocol migration default")}</small></article>
         <article><span>YOUR WEIGHTED SCORE</span><strong>${score === null ? "Unknown" : `${score.toFixed(1)} / 100`}</strong><small>${preferences.inflationWeight}% inflation · ${100 - preferences.inflationWeight}% block revenue</small></article>
-        <article><span>STATE SOURCE</span><strong>VoteState ${validator.voteStateVersion ?? "unknown"}</strong><small>${validator.commissionSource ?? "Not identified"}</small></article>
+        <article><span>STATE SOURCE</span><strong>VoteState ${validator.voteStateVersion === null ? "unknown" : `v${escapeHtml(validator.voteStateVersion)}`}</strong><small>${escapeHtml(validator.commissionSource ?? "Not identified")}</small></article>
       </div>
       <div class="detail-collectors">
         <article><span>INFLATION REWARDS COLLECTOR</span><code>${escapeHtml(validator.inflationCollector ?? "Not available")}</code></article>
@@ -319,30 +356,56 @@ async function openValidator(votePubkey, updateUrl = true) {
       <div class="detail-actions"><button class="watch-toggle ${watched ? "watched" : ""}" data-watch="${escapeHtml(votePubkey)}">${watched ? "★ Remove from watchlist" : "☆ Add to watchlist"}</button><span>Last observed ${escapeHtml(new Date(validator.updatedAt).toLocaleString())}</span></div>
       <div class="history-block"><h3>Commission history</h3>${renderHistoryChart(validatorHistory)}</div>
       <div class="history-block"><h3>Recent observed changes</h3><div class="detail-timeline">${
-        validatorHistory.length ? validatorHistory.map((entry) => `<article>
-          <span class="timeline-dot"></span><div><strong>${escapeHtml(entry.eventType.replaceAll("_", " "))}</strong>
+        validatorHistory.length ? groupHistory(validatorHistory).map((entry) => `<article>
+          <span class="timeline-dot"></span><div><strong>${escapeHtml(entry.eventTypes.map((type) => type.replaceAll("_", " ")).join(" · "))}</strong>
           <p>${escapeHtml(new Date(entry.recordedAt).toLocaleString())} · slot ${escapeHtml(entry.slot)}</p>
           <p>Inflation ${percentage(entry.inflationCommissionBps) ?? "—"} · Block revenue ${percentage(entry.blockRevenueCommissionBps) ?? "—"}</p>
           <p class="collector-history">INF ${escapeHtml(shorten(entry.inflationCollector ?? "—"))} · REV ${escapeHtml(shorten(entry.blockRevenueCollector ?? "—"))}</p>
           </div></article>`).join("") : '<p class="empty-alert">No observations yet.</p>'
       }</div></div>`;
+}
+
+async function openValidator(votePubkey, updateUrl = true) {
+  const requestId = ++detailRequest;
+  try {
+    const encodedKey = encodeURIComponent(votePubkey);
+    const [validatorResponse, historyResponse] = await Promise.all([
+      fetch(`/api/validators/${encodedKey}`),
+      fetch(`/api/validators/${encodedKey}/history?limit=100`)
+    ]);
+    throwIfRateLimited(validatorResponse, historyResponse);
+    if (!validatorResponse.ok || !historyResponse.ok) {
+      throw new Error("Unable to load validator detail and history");
+    }
+    const [{ data: validator }, { data: validatorHistory }] = await Promise.all([
+      validatorResponse.json(), historyResponse.json()
+    ]);
+    // A newer request (or closing the panel) supersedes this one.
+    if (requestId !== detailRequest) return;
+    currentDetail = { validator, history: validatorHistory };
+    renderDetail();
     detailSection.classList.remove("hidden");
     if (updateUrl && location.pathname !== `/validator/${encodedKey}`) {
       window.history.pushState({ votePubkey }, "", `/validator/${encodedKey}`);
     }
     detailSection.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
+    if (requestId !== detailRequest) return;
     console.error("Unable to open validator detail", error);
     detailSection.classList.remove("hidden");
-    detailSection.innerHTML = '<div class="empty-alert">Validator detail is temporarily unavailable.</div>';
+    detailSection.innerHTML = `<div class="empty-alert">${
+      error instanceof RateLimitError
+        ? `Request limit reached. Try again in ${formatDuration(error.retryAfterSeconds)}.`
+        : "Validator detail is temporarily unavailable."
+    }</div>`;
   }
 }
 
-function categoryEnabled(alert) {
-  if (alert.field.includes("commission")) return preferences.notifyCommission;
-  if (alert.field.includes("collector")) return preferences.notifyCollector;
-  if (alert.field === "validator_status") return preferences.notifyStatus;
-  return false;
+function throwIfRateLimited(...responses) {
+  const limited = responses.find((response) => response.status === 429);
+  if (limited) {
+    throw new RateLimitError(Number(limited.headers.get("retry-after")) || 60);
+  }
 }
 
 function processLiveAlerts(newAlerts) {
@@ -377,7 +440,7 @@ async function loadData() {
   }
   const query = search.value.trim();
   if (query) params.set("q", query);
-  if (selectedStatus === "current" || selectedStatus === "delinquent") {
+  if (["current", "delinquent", "inactive"].includes(selectedStatus)) {
     params.set("status", selectedStatus);
   }
   if (selectedStatus === "watchlist") {
@@ -394,11 +457,14 @@ async function loadData() {
     fetch(`/api/alerts?${alertParams}`),
     fetch("/api/health")
   ]);
+  // Health is not rate limited, so show it even when the data calls are refused.
+  if (healthResponse.ok) renderHealth(await healthResponse.json());
+  throwIfRateLimited(validatorResponse, alertsResponse);
   if (!validatorResponse.ok || !alertsResponse.ok || !healthResponse.ok) {
     throw new Error("The data API returned an unsuccessful response");
   }
-  const [validatorPayload, alertPayload, health] = await Promise.all([
-    validatorResponse.json(), alertsResponse.json(), healthResponse.json()
+  const [validatorPayload, alertPayload] = await Promise.all([
+    validatorResponse.json(), alertsResponse.json()
   ]);
   renderValidators(validatorPayload.data, validatorPayload.meta.total);
   renderAlerts(alertPayload.data, alertPayload.meta.total);
@@ -408,6 +474,9 @@ async function loadData() {
     );
     localStorage.setItem(lastAlertKey, String(lastAlertId));
   }
+}
+
+function renderHealth(health) {
   document.querySelector("#change-count").textContent =
     Number(health.changeCount).toLocaleString();
   document.querySelector("#validator-count").textContent =
@@ -480,6 +549,8 @@ alerts.addEventListener("click", (event) => {
 });
 detailSection.addEventListener("click", (event) => {
   if (event.target.closest("#close-detail")) {
+    detailRequest += 1;
+    currentDetail = null;
     detailSection.classList.add("hidden");
     window.history.replaceState({}, "", "/");
     return;
@@ -500,19 +571,29 @@ function toggleWatch(votePubkey) {
     watchlist.add(votePubkey);
   }
   persistWatchlist();
-  if (location.pathname.startsWith("/validator/")) {
-    void openValidator(votePubkey, false);
-  }
+  if (currentDetail?.validator.votePubkey === votePubkey) renderDetail();
 }
 
 document.querySelector("#mix-weight").addEventListener("input", (event) => {
   preferences.inflationWeight = Number(event.target.value);
   savePreferences();
   syncPreferenceControls();
-  void refresh();
-  if (location.pathname.startsWith("/validator/")) {
-    void openValidator(decodeURIComponent(location.pathname.split("/").at(-1)), false);
+  // Scores are computed in the browser; only the server-side sort needs a fetch.
+  if (lastValidators) renderValidators(lastValidators.data, lastValidators.total);
+  renderDetail();
+  if (sortBy === "commission") {
+    clearTimeout(weightRefreshTimer);
+    weightRefreshTimer = setTimeout(() => void refresh(), 300);
   }
+});
+document.querySelector("#commission-threshold").addEventListener("change", (event) => {
+  const value = Number(event.target.value);
+  if (!Number.isSafeInteger(value) || value < 0 || value > 10_000) {
+    event.target.value = preferences.commissionIncreaseThresholdBps;
+    return;
+  }
+  preferences.commissionIncreaseThresholdBps = value;
+  savePreferences();
 });
 document.querySelector("#watchlist-only").addEventListener("change", (event) => {
   preferences.watchlistOnly = event.target.checked;
@@ -527,7 +608,7 @@ for (const [id, key] of [
   document.querySelector(`#${id}`).addEventListener("change", (event) => {
     preferences[key] = event.target.checked;
     savePreferences();
-    void refresh();
+    if (lastAlerts) renderAlerts(lastAlerts.data, lastAlerts.total);
   });
 }
 document.querySelector("#enable-notifications").addEventListener("click", async (event) => {
@@ -542,7 +623,11 @@ document.querySelector("#enable-notifications").addEventListener("click", async 
 window.addEventListener("popstate", () => {
   const match = location.pathname.match(/^\/validator\/([^/]+)$/);
   if (match) void openValidator(decodeURIComponent(match[1]), false);
-  else detailSection.classList.add("hidden");
+  else {
+    detailRequest += 1;
+    currentDetail = null;
+    detailSection.classList.add("hidden");
+  }
 });
 
 async function refresh() {
@@ -556,6 +641,10 @@ async function refresh() {
   try {
     await loadData();
   } catch (error) {
+    if (error instanceof RateLimitError) {
+      showRateLimited(error.retryAfterSeconds);
+      return;
+    }
     console.error("Unable to load validator data", error);
     rows.innerHTML = '<tr><td colspan="8" class="empty">Validator data is temporarily unavailable. The monitor will retry automatically.</td></tr>';
     document.querySelector("#health-status").innerHTML = "<i></i> OFFLINE";
@@ -571,17 +660,50 @@ async function refresh() {
   }
 }
 
+function showRateLimited(retryAfterSeconds) {
+  document.querySelector("#health-status").innerHTML = "<i></i> RATE LIMITED";
+  document.querySelector("#health-foot").textContent =
+    `request limit reached · retrying in ${formatDuration(retryAfterSeconds)}`;
+  if (!lastValidators) {
+    rows.innerHTML = `<tr><td colspan="8" class="empty">Request limit reached for this network. Data will reload in ${formatDuration(retryAfterSeconds)}.</td></tr>`;
+  }
+  clearTimeout(rateLimitTimer);
+  rateLimitTimer = setTimeout(() => void refresh(), retryAfterSeconds * 1000);
+}
+
+// Live updates drive refreshes; polling only runs while the stream is down.
+function setFallbackPolling(enabled) {
+  if (enabled && !fallbackTimer) {
+    fallbackTimer = setInterval(() => void refresh(), fallbackPollMs);
+  } else if (!enabled && fallbackTimer) {
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+}
+
 function connectLiveUpdates() {
   const status = document.querySelector("#live-connection");
   const pulse = document.querySelector("#network-pulse");
   const source = new EventSource("/api/events");
+  let wasConnected = false;
   source.addEventListener("open", () => {
     status.textContent = "LIVE UPDATES";
     pulse.classList.add("online");
+    setFallbackPolling(false);
+    // Catch up on anything missed while reconnecting.
+    if (wasConnected) void refresh();
+    wasConnected = true;
   });
   source.addEventListener("error", () => {
-    status.textContent = "RECONNECTING";
     pulse.classList.remove("online");
+    setFallbackPolling(true);
+    if (source.readyState === EventSource.CLOSED) {
+      // The server refused the stream (e.g. too many tabs); retry later.
+      status.textContent = "PERIODIC UPDATES";
+      setTimeout(connectLiveUpdates, 5 * 60_000);
+    } else {
+      status.textContent = "RECONNECTING";
+    }
   });
   source.addEventListener("update", (event) => {
     try {
@@ -595,9 +717,10 @@ function connectLiveUpdates() {
 }
 
 syncPreferenceControls();
-void refresh().then(connectLiveUpdates);
+const initialLoad = refresh();
+void initialLoad.then(connectLiveUpdates);
 const initialValidatorRoute = location.pathname.match(/^\/validator\/([^/]+)$/);
 if (initialValidatorRoute) {
-  void openValidator(decodeURIComponent(initialValidatorRoute[1]), false);
+  // Wait for the directory to render first, or it pushes the profile out of view.
+  void initialLoad.then(() => openValidator(decodeURIComponent(initialValidatorRoute[1]), false));
 }
-setInterval(() => void refresh(), 60_000);

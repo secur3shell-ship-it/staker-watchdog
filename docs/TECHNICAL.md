@@ -12,8 +12,9 @@ Solana JSON-RPC (finalized)
        │
        ▼
   SolanaRpc ──► ValidatorMonitor ──► WatchdogStore ──► local SQLite
-                       │              │
-                       │              └── optional webhook POSTs
+                       │                                  │
+                       │              WebhookDispatcher ◄─┘ (alerts table as outbox)
+                       │                     └── optional signed webhook POSTs
                        └── committed sync events ──► SSE clients
 
 Browser ──HTTP/API + EventSource──► Express static dashboard + /api endpoints
@@ -49,17 +50,28 @@ The service POSTs JSON-RPC 2.0 to the configured `RPC_URL`. It uses finalized co
 - `getSlot({ commitment: "finalized" })` records the snapshot's finalized slot.
 - `getEpochInfo({ commitment: "finalized" })` records the epoch.
 
-Each non-null vote account is checked for the canonical vote-program owner `Vote111111111111111111111111111111111111111` before the account data is decoded. RPC response shape, HTTP status, JSON-RPC errors, account owner, and base64 metadata are validated. A failed fetch prevents the snapshot from being written.
+Each non-null vote account is checked for the canonical vote-program owner `Vote111111111111111111111111111111111111111` before the account data is decoded. RPC response shape, HTTP status, JSON-RPC errors, account owner, and base64 metadata are validated. A failed fetch or malformed RPC envelope prevents the snapshot from being written. A problem with one individual account (missing, wrong owner, unknown state tag, malformed data) is reported per account instead: it is logged as a warning and does not stop the other validators from being synced (see [Poller, alerts, and failure behavior](#poller-alerts-and-failure-behavior)).
 
 Large integer JSON values are parsed losslessly. In the API, activated stake is exposed in lamports as a decimal string; clients must not assume it is a JavaScript-safe integer. The UI converts lamports with `BigInt` before formatting SOL.
 
 ### Vote account versions
 
+Vote accounts hold a bincode-serialized `VoteStateVersions` enum, so the leading `u32` is the **enum variant index**, not the layout's version number:
+
+| Tag (`u32` at `0..4`) | Variant | API `voteStateVersion` | Handling |
+| --- | --- | --- | --- |
+| `0` | `V0_23_5` | `0` | Legacy migration defaults |
+| `1` | `V1_14_11` | `1` | Legacy migration defaults |
+| `2` | `V3` | `3` | Legacy migration defaults |
+| `3` | `V4` | `4` | Decoded from account bytes |
+
+The API's `voteStateVersion` is the layout version in the third column, not the raw tag. (Before 2026-10-18 the code read tag `3` as a legacy V3 account, so every mainnet V4 account was labelled `legacy_migration_default` and its on-chain collectors were hidden behind defaults.)
+
 For VoteStateV4, the fixed header is decoded little-endian from the vote program's serialized account data. The relevant offsets in the current documented layout are:
 
 | Byte range / offset | Field |
 | --- | --- |
-| `0..4` | State version tag (`u32`, expected `4`) |
+| `0..4` | `VoteStateVersions` enum tag (`u32`, `3` for V4) |
 | `4..36` | Validator node identity pubkey |
 | `36..68` | Authorized withdrawer pubkey |
 | `68..100` | Inflation-rewards collector pubkey |
@@ -67,7 +79,7 @@ For VoteStateV4, the fixed header is decoded little-endian from the vote program
 | `132..134` | Inflation-rewards commission, basis points (`u16`) |
 | `134..136` | Block-revenue commission, basis points (`u16`) |
 
-At least 144 bytes are required before reading the v4 fixed fields. Public keys are Base58-encoded after decoding. Unknown state versions cause the monitor to report a sync error; it does not interpret them as an older or newer layout.
+At least 144 bytes are required before reading the v4 fixed fields. Public keys are Base58-encoded after decoding. Unknown tags are rejected for that account rather than interpreted as an older or newer layout. The decoder is tested against a real finalized mainnet V4 account ([`test/fixtures/mainnet-vote-account-v4.json`](../test/fixtures/mainnet-vote-account-v4.json)), cross-checked against the independent `getVoteAccounts` commission.
 
 Protocol references:
 
@@ -112,11 +124,11 @@ The server creates the parent directory, enables `journal_mode = WAL`, and appli
 
 #### `validators`
 
-One upserted row per vote-account address. Includes identity, state version and source, current/delinquent status, exact activated stake string, both commissions, both collectors, root and last-vote slots, the comparison score, and last update time. This is a **latest-state table**, not an append-only time series.
+One upserted row per vote-account address. Includes identity, state version and source, `current`/`delinquent`/`inactive` status, exact activated stake string, both commissions, both collectors, root and last-vote slots, the comparison score, and last update time. This is a **latest-state table**, not an append-only time series.
 
 #### `alerts`
 
-Append-only observed changes to the two commissions, two collectors, and current/delinquent status. Each row contains a monotonically allocated ID, vote and node pubkeys, changed field name, previous/new string values, and detection timestamp. There is no automatic retention/deletion job in this MVP.
+Append-only observed changes to the two commissions, two collectors, and `current`/`delinquent`/`inactive` status. The table also serves as the webhook outbox (see below). Each row contains a monotonically allocated ID, vote and node pubkeys, changed field name, previous/new string values, and detection timestamp. There is no automatic retention/deletion job in this MVP.
 
 #### `validator_history`
 
@@ -124,7 +136,7 @@ Per-validator observed history. The first sync stores a `baseline` row. Later ro
 
 #### `metadata`
 
-Key/value record for last successful sync timestamp, finalized slot, finalized epoch, and validator count.
+Key/value record for last successful sync timestamp, finalized slot, finalized epoch, active validator count, and `webhook_delivered_alert_id` (the webhook delivery cursor, present once a webhook is configured).
 
 ### Scope, backup, and deletion
 
@@ -134,30 +146,43 @@ Changing `DATABASE_PATH` starts/opens another database file; it does not move or
 
 ### Observed local contents at documentation time
 
-The smoke test created the default database and synced 681 validator records. At inspection time it contained 681 rows in `validators`, 681 initial baselines in `validator_history`, zero rows in `alerts`, and four rows in `metadata`. These are ephemeral values that change with RPC polling, not a schema guarantee.
+The smoke test created the default database and synced 681 validator records. After the 2026-10-18 upgrade sync it contained 681 rows in `validators`, 1,396 rows in `validator_history` (baselines, the one-time `source_change` rows, and later transitions), 35 rows in `alerts` (30 one-time collector corrections from the upgrade plus status changes), and four rows in `metadata` (no webhook cursor, because no webhook is configured). A pre-upgrade copy is kept as `.data/staker-watchdog.pre-fix-backup-2026-10-18.sqlite`. These are ephemeral values that change with RPC polling, not a schema guarantee.
 
 ## HTTP API
 
-API paths are rooted at `/api`. Unless noted, a supplied invalid `X-API-Key` returns `401`; requests over a limit return `429` and `Retry-After`.
+API paths are rooted at `/api`. Unless noted, a supplied invalid `X-API-Key` returns `401` (and is counted against the caller's free limit); requests over a limit return `429` and `Retry-After`. Unknown `/api` routes return `404 { error: "not_found" }`; malformed requests such as invalid percent-encoding return `400 { error: "bad_request" }`.
 
 | Route | Response / behavior |
 | --- | --- |
-| `GET /api/health` | `ok`, last sync timestamp, slot, epoch, validator count, total change count, and `stale` flag |
-| `GET /api/validators` | `{ data, meta }`; defaults to 500, max 1000; `q` searches vote/node addresses; `status` filters `current`/`delinquent`/`watchlist`; repeated `watchlist` addresses filter a watched list (max 100); `sort` accepts `stake`, `commission`, `inflation`, `blockRevenue`, or `status`; `direction=asc|desc`; `offset` paginates; `inflationWeight=0..100` optionally makes commission sorting match a local mix (default 50) |
+| `GET /api/health` | `ok`, last sync timestamp, slot, epoch, active validator count, total change count, and `stale` flag |
+| `GET /api/validators` | `{ data, meta }`; defaults to 500, max 1000; `q` searches vote/node addresses; `status` filters `current`/`delinquent`/`inactive`/`watchlist` (without `status`, inactive validators are omitted; `watchlist` includes them); repeated `watchlist` addresses filter a watched list (max 100); `sort` accepts `stake`, `commission`, `inflation`, `blockRevenue`, or `status`; `direction=asc|desc`; `offset` paginates; `inflationWeight=0..100` optionally makes commission sorting match a local mix (default 50) |
 | `GET /api/validators/:votePubkey` | `{ data, tier }` or `404 { error: "validator_not_found" }` |
 | `GET /api/validators/:votePubkey/history?limit=100` | Observed baseline and meaningful state transitions (max 500) or validator 404 |
 | `GET /api/alerts` | `{ data, meta }`; defaults to 50, max 200, accepts `offset`; optional repeated `watchlist` addresses filter (max 100); `watchlistOnly=true` with no address returns an empty list |
-| `GET /api/events` | `text/event-stream`; sends `connected`, then `update` events after successful committed syncs |
+| `GET /api/events` | `text/event-stream`; sends `connected`, then `update` events after successful committed syncs. `429 too_many_event_streams` above the per-client cap; `503 event_stream_capacity_reached` (with `Retry-After: 60`) above the total cap |
 
 Validator fields are defined in [`ValidatorSnapshot`](../src/types.ts). Commission values use integer basis points (e.g. `1250` = 12.5%). When a value is not available, it is `null`. Sorts keep unknown commission scores/rates last in either direction; stake comparisons use `BigInt` so u64 ordering remains precise.
 
 Health is intentionally registered before the API rate-limit middleware, so it is currently unauthenticated and not counted against those API limits. Validator, history, alert, and SSE endpoints are behind the middleware.
 
+### Response headers and errors
+
+Every response (static and API) carries a Content-Security-Policy (`default-src 'none'`; `script-src`, `style-src`, `font-src`, `connect-src 'self'`; `img-src 'self' data:`; `base-uri 'none'`; `form-action 'none'`; `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`, and a restrictive `Permissions-Policy`. `Strict-Transport-Security` is added when Express sees the request as secure (HTTPS, or HTTPS at a trusted proxy). The dashboard uses no inline scripts or styles and self-hosts its fonts (`public/fonts`, DM Sans and DM Mono latin WOFF2 from `@fontsource` 5.3.0, SIL OFL), so it makes no third-party requests.
+
+Express's default error page, which echoed stack traces and absolute file paths, is replaced: API errors return the JSON bodies above (500s are logged and return `internal_server_error`), and non-API errors return plain status text such as `Bad Request`.
+
 ### Live events
 
-`/api/events` uses Server-Sent Events (one-way HTTP streaming; no WebSocket server). When a database transaction successfully commits a full sync, connected clients receive an `update` JSON event containing `slot`, `epoch`, `validatorCount`, `syncedAt`, and the alert rows created for that sync. A comment heartbeat is sent every 25 seconds. Disconnected clients are removed; EventSource clients reconnect and refresh through the normal JSON APIs. Events are not retained/replayed by SSE itself; the SQLite alert/history endpoints are the durable read path. API limits count an SSE connection at request-open time, not continuously for the whole stream.
+`/api/events` uses Server-Sent Events (one-way HTTP streaming; no WebSocket server). When a database transaction successfully commits a full sync, connected clients receive an `update` JSON event containing `slot`, `epoch`, `validatorCount`, `syncedAt`, and the alert rows created for that sync. A comment heartbeat is sent every 25 seconds. Disconnected clients are removed; EventSource clients reconnect and refresh through the normal JSON APIs. Events are not retained/replayed by SSE itself; the SQLite alert/history endpoints are the durable read path. API limits count an SSE connection at request-open time, not continuously for the whole stream, so open streams are capped separately: `SSE_MAX_CONNECTIONS_PER_CLIENT` (default 10, keyed by the same identity as the rate limiter) and `SSE_MAX_CONNECTIONS` (default 1000 in total). A client whose write buffer fills during an update or heartbeat is closed.
 
-The dashboard also retains a 60-second refresh fallback. It does not require SSE to keep the main directory functional.
+The dashboard refreshes on each SSE `update` (and once after reconnecting). It polls only while the stream is down, every 2 minutes; if the server refuses the stream (for example the per-client cap), the dashboard switches to that periodic mode and retries the stream after 5 minutes. Weight-slider, watch-star, and alert-category changes re-render already-loaded data instead of refetching; only a commission-score sort makes a debounced request. A `429` shows `RATE LIMITED` with the retry time and reloads after `Retry-After`, keeping already-rendered data on screen; health metrics still render because `/api/health` is not limited. Detail-panel responses that arrive after a newer request (or after closing the panel) are discarded.
+
+### Dashboard layout notes
+
+- A deep link (`/validator/:votePubkey`) opens the profile only after the first directory render, so the directory above it cannot push the profile out of view.
+- At widths of 600px and below, directory rows become labelled cards (every field visible, no horizontal scrolling); wider screens keep the table.
+- Empty states are specific to the active filter or search (for example, "No inactive validators").
+- History rows recorded by the same sync (for example `configuration_change` and `source_change`) are shown as one timeline entry and one chart point.
 
 ### Browser-local personalization
 
@@ -167,8 +192,10 @@ The UI includes only selected watchlist pubkeys as explicit API query filters. T
 
 ## API tier mechanics
 
-- Free requests are keyed to Express's `request.ip`, default limit 120 per 15 minutes.
-- Institutional keys are supplied through `STAKER_API_KEYS`, as comma-separated `key:tier` pairs, for example `team-secret:institution`.
+- Free requests are keyed to Express's `request.ip`, default limit 120 per 15 minutes. IPv6 clients share a bucket per `/64` (a single host usually controls a whole `/64`); IPv4-mapped IPv6 addresses are normalised to IPv4.
+- `request.ip` honours `X-Forwarded-For` only when `TRUST_PROXY` is set to a hop count (e.g. `1`) or a list of proxy addresses/subnets, passed to Express's `trust proxy`. Without it, every client behind a reverse proxy shares the proxy's bucket. `TRUST_PROXY=true` is rejected at startup because it would trust spoofed headers and let callers choose their own bucket.
+- Requests with an unrecognised `X-API-Key` are charged to the caller's free bucket before the `401`, so key guessing is rate limited like any other request (and gets `429` once the bucket is exhausted).
+- Institutional keys are supplied through `STAKER_API_KEYS`, as comma-separated `key:tier` pairs. Keys must be at least 32 characters (generate with `openssl rand -hex 24`) and the tier must not be `free`; otherwise the server refuses to start.
 - Clients send a key in the `X-API-Key` header.
 - The process stores only SHA-256 key hashes in its in-memory key map; raw key strings are read from the environment at startup, not saved in SQLite.
 - Configured non-free keys are counted per key; default `PAID_RATE_LIMIT` is 6000 per 15 minutes.
@@ -177,11 +204,29 @@ The UI includes only selected watchlist pubkeys as explicit API query filters. T
 
 ## Poller, alerts, and failure behavior
 
-The poller starts immediately on server start, then repeats after `POLL_INTERVAL_MS` (default 300,000 ms). An in-flight guard prevents overlapping poll runs. A successful nonempty snapshot is atomically committed to the database before webhook delivery.
+The poller starts immediately on server start, then repeats after `POLL_INTERVAL_MS` (default 300,000 ms). An in-flight guard prevents overlapping poll runs. A successful nonempty snapshot is atomically committed to the database; webhook delivery happens separately and never delays the next poll.
 
-On a change, one alert row is inserted for each changed monitored commission/collector or current/delinquent status field. A baseline is required, and null-to-known data is not interpreted as a change. History records baseline plus meaningful configuration/status/identity/source transitions. Webhooks run after commit; a webhook failure is logged and is not retried automatically. SSE broadcasts only after the database commit.
+On a change, one alert row is inserted for each changed monitored commission/collector or status field. A baseline is required, and null-to-known data is not interpreted as a change. History records baseline plus meaningful configuration/status/identity/source transitions. SSE broadcasts only after the database commit.
 
-Poll errors (including RPC errors, malformed response/account data, unsupported vote-state versions, and empty snapshots) are logged. A failed poll does not update the last-successful-sync metadata or replace the stored validator snapshot. `/api/health` reports stale when there has been no successful sync or the last one is more than two poll intervals old.
+Validators that stop appearing in `getVoteAccounts` (closed or fully unstaked vote accounts) are marked `inactive` with a `validator_status` alert and a `status_change` history row; their last observed configuration, stake, and `updatedAt` are kept. If one returns, the normal comparison emits an `inactive` → `current`/`delinquent` alert. As a guard against truncated RPC responses, a sync that would remove more than max(10, 20% of the active validators) skips all removals and logs a warning.
+
+Individual accounts that cannot be read (missing, wrong owner, unknown tag, malformed data) are logged as a warning. The validator's status, stake, and slots still update, but its commissions, collectors, source, and version are carried forward from the last decoded state, so a transient gap neither erases data nor hides a change made during the gap (it is alerted once the account is readable again). A brand-new validator that is unreadable gets its inflation commission from `getVoteAccounts` and `null` for the other fields, with `commissionSource` `null`.
+
+Poll errors (RPC errors, malformed RPC envelopes, and empty snapshots) are logged. A failed poll does not update the last-successful-sync metadata or replace the stored validator snapshot. `/api/health` reports stale when there has been no successful sync or the last one is more than two poll intervals old.
+
+### Webhook delivery
+
+When `ALERT_WEBHOOK_URL` (must be `http(s)`) is set, `WebhookDispatcher` delivers alerts from the `alerts` table, which acts as an outbox. The metadata key `webhook_delivered_alert_id` records the last delivered alert. The first time a dispatcher starts it sets this cursor to the newest existing alert, so history is not replayed. Delivery is in alert-id order, outside the poll loop, at least once, and resumes from the cursor after a restart.
+
+Each POST body is one alert as JSON, with headers:
+
+- `x-staker-watchdog-delivery`: the alert ID (use it to ignore duplicates).
+- `x-staker-watchdog-timestamp`: Unix seconds.
+- `x-staker-watchdog-signature`: `v1=` + hex HMAC-SHA256 of `${timestamp}.${body}` with `ALERT_WEBHOOK_SECRET`. Sent only when the secret is set; the server warns at startup if a URL is configured without one. Receivers should compare in constant time and reject old timestamps.
+
+Network errors, `408`, `429`, and `5xx` responses retry with exponential backoff from 5 seconds up to 5 minutes, indefinitely, so a receiver outage delays but does not lose alerts. Other `4xx` responses are treated as permanent rejections: the alert is logged and skipped. Redirects are not followed.
+
+[INTEGRATIONS.md](./INTEGRATIONS.md) explains webhooks for receiver authors, with a tested verification example, and compares them with SSE, desktop notifications, the JSON API, and the RPC dependency.
 
 ## Configuration and operations
 
@@ -194,12 +239,16 @@ See [`.env.example`](../.env.example). The key settings are:
 | `RPC_URL` | Public mainnet RPC | Trusted Solana JSON-RPC endpoint |
 | `DATABASE_PATH` | `.data/staker-watchdog.sqlite` | SQLite file path (resolved from working directory) |
 | `POLL_INTERVAL_MS` | `300000` | Poll interval |
-| `FREE_RATE_LIMIT` | `120` | Requests per free IP per 15-minute window |
+| `FREE_RATE_LIMIT` | `120` | Requests per free IP (IPv6 `/64`) per 15-minute window |
 | `PAID_RATE_LIMIT` | `6000` | Requests per provisioned key per 15-minute window |
-| `STAKER_API_KEYS` | empty | Comma-separated `key:tier` entries |
-| `ALERT_WEBHOOK_URL` | empty | Optional JSON POST target |
+| `STAKER_API_KEYS` | empty | Comma-separated `key:tier` entries; keys of at least 32 characters |
+| `TRUST_PROXY` | off | Proxy hop count or address/subnet list for `X-Forwarded-For`; `true` is rejected |
+| `SSE_MAX_CONNECTIONS` | `1000` | Total open event streams |
+| `SSE_MAX_CONNECTIONS_PER_CLIENT` | `10` | Open event streams per IP bucket or API key |
+| `ALERT_WEBHOOK_URL` | empty | Optional `http(s)` JSON POST target |
+| `ALERT_WEBHOOK_SECRET` | empty | HMAC secret for signing webhook deliveries |
 
-For container deployment, persist/mount the directory containing `DATABASE_PATH`; otherwise a replacement container can lose local state. `HOST=0.0.0.0` exposes the HTTP service on container interfaces and should be paired with the deployment's intended network controls.
+For container deployment, persist/mount the directory containing `DATABASE_PATH`; otherwise a replacement container can lose local state. `HOST=0.0.0.0` exposes the HTTP service on container interfaces and should be paired with the deployment's intended network controls. Behind a load balancer or reverse proxy, set `TRUST_PROXY` so rate limits apply per client rather than to the proxy.
 
 ## Tests and source map
 
@@ -208,11 +257,15 @@ npm test
 npm run typecheck
 ```
 
-- `src/rpc.ts`: JSON-RPC transport and account batching.
-- `src/vote-account.ts`: version identification and v4 binary decoding.
-- `src/monitor.ts`: polling, defaults, score, change and webhook orchestration.
+- `src/rpc.ts`: JSON-RPC transport, account batching, and per-account read failures.
+- `src/vote-account.ts`: enum-tag-to-version mapping and v4 binary decoding.
+- `src/monitor.ts`: polling, legacy defaults, carry-forward of unreadable accounts, inactive detection, and score.
 - `src/scoring.ts`: isolated score formula.
 - `src/store.ts`: SQLite schema, migrations, latest snapshots, history, alerts, metadata.
-- `src/server.ts`: static/detail-route delivery, REST endpoints, rate limits, SSE, and process lifecycle.
-- `public/`: browser UI.
-- `test/`: score, decoding, RPC-shape/precision, alert, and schema-migration tests.
+- `src/webhook.ts`: outbox-style webhook dispatcher, retries, and HMAC signing.
+- `src/config.ts`: environment parsing and startup validation (`loadConfig`, `parseApiKeys`, `parseTrustProxy`).
+- `src/app.ts`: `createApp` — static/detail-route delivery, REST endpoints, security headers, rate limits, SSE caps, and error handlers.
+- `src/server.ts`: thin bootstrap wiring config, store, monitor, dispatcher, and process lifecycle.
+- `public/`: browser UI; `public/fonts/`: self-hosted fonts and licences.
+- `media/generate-videos.mjs`: rebuilds both product videos from real screenshots of a running instance (see [`media/README.md`](../media/README.md)).
+- `test/`: score, decoding (including a real mainnet V4 fixture), RPC-shape/precision, per-account failures, monitor carry-forward and inactive detection, alert, webhook delivery, HTTP limits/headers/errors, configuration, and schema-migration tests.

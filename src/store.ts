@@ -84,10 +84,16 @@ export class WatchdogStore {
     }
   }
 
+  /**
+   * Persists one successful sync. `inactiveVotePubkeys` lists stored validators
+   * that the RPC no longer reports; they are marked inactive with a status alert
+   * while keeping their last observed configuration.
+   */
   applySnapshot(
     snapshots: ValidatorSnapshot[],
     slot: number,
-    epoch: number
+    epoch: number,
+    inactiveVotePubkeys: string[] = []
   ): ValidatorAlert[] {
     const detectedAt = new Date().toISOString();
     const alerts: ValidatorAlert[] = [];
@@ -143,6 +149,9 @@ export class WatchdogStore {
         commission_score=excluded.commission_score,
         updated_at=excluded.updated_at
     `);
+    const markInactive = this.db.prepare(
+      "UPDATE validators SET status = 'inactive' WHERE vote_pubkey = ?"
+    );
     const insertMetadata = this.db.prepare(`
       INSERT INTO metadata (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value
@@ -228,6 +237,36 @@ export class WatchdogStore {
           });
         }
         upsertValidator.run(snapshot);
+      }
+      for (const votePubkey of inactiveVotePubkeys) {
+        const previous = getPrevious.get(votePubkey) as
+          | Record<string, string | number | null>
+          | undefined;
+        if (!previous || previous.status === "inactive") continue;
+        const alert = {
+          votePubkey,
+          nodePubkey: String(previous.node_pubkey),
+          field: "validator_status" as const,
+          previousValue: String(previous.status),
+          newValue: "inactive",
+          detectedAt
+        };
+        const result = insertAlert.run(alert);
+        alerts.push({ id: Number(result.lastInsertRowid), ...alert });
+        insertHistory.run({
+          votePubkey,
+          nodePubkey: previous.node_pubkey,
+          status: "inactive",
+          eventType: "status_change",
+          inflationCommissionBps: previous.inflation_commission_bps,
+          blockRevenueCommissionBps: previous.block_revenue_commission_bps,
+          inflationCollector: previous.inflation_collector,
+          blockRevenueCollector: previous.block_revenue_collector,
+          commissionSource: previous.commission_source,
+          slot: String(slot),
+          recordedAt: detectedAt
+        });
+        markInactive.run(votePubkey);
       }
       insertMetadata.run("last_successful_sync_at", detectedAt);
       insertMetadata.run("current_slot", String(slot));
@@ -339,6 +378,41 @@ export class WatchdogStore {
       count: number;
     };
     return result.count;
+  }
+
+  listAlertsAfter(afterId: number, limit: number): ValidatorAlert[] {
+    return this.db.prepare(`
+      SELECT
+        id,
+        vote_pubkey AS votePubkey,
+        node_pubkey AS nodePubkey,
+        field,
+        previous_value AS previousValue,
+        new_value AS newValue,
+        detected_at AS detectedAt
+      FROM alerts WHERE id > ? ORDER BY id ASC LIMIT ?
+    `).all(afterId, limit) as ValidatorAlert[];
+  }
+
+  getLatestAlertId(): number {
+    const result = this.db.prepare("SELECT MAX(id) AS id FROM alerts").get() as {
+      id: number | null;
+    };
+    return result.id ?? 0;
+  }
+
+  getMetadata(key: string): string | null {
+    const result = this.db.prepare("SELECT value FROM metadata WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return result?.value ?? null;
+  }
+
+  setMetadata(key: string, value: string): void {
+    this.db.prepare(`
+      INSERT INTO metadata (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    `).run(key, value);
   }
 
   getStatus(): Record<string, string | null> {

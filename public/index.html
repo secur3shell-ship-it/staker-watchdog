@@ -6,9 +6,7 @@
     <meta name="theme-color" content="#f6f1f2" />
     <meta name="description" content="Independent Solana validator commission and collector monitoring." />
     <title>Staker Watchdog — Validator intelligence</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="icon" href="/image.png" type="image/png" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
@@ -39,7 +37,7 @@
 
         <section class="metrics" aria-label="Network overview">
           <article><span class="metric-label">VALIDATORS TRACKED</span><strong id="validator-count">—</strong><span class="metric-foot">current + delinquent</span></article>
-          <article><span class="metric-label">CONFIG CHANGES</span><strong id="change-count">—</strong><span class="metric-foot">recently detected</span></article>
+          <article><span class="metric-label">CONFIG CHANGES</span><strong id="change-count">—</strong><span class="metric-foot">since monitoring began</span></article>
           <article><span class="metric-label">LAST SYNC</span><strong class="metric-time" id="last-sync">Waiting for first sync</strong><span class="metric-foot" id="sync-slot">finalized cluster data</span></article>
           <article class="health-card"><span class="metric-label">MONITOR STATUS</span><strong class="health" id="health-status"><i></i> CONNECTING</strong><span class="metric-foot" id="health-foot">syncing validator accounts</span></article>
         </section>
@@ -59,6 +57,7 @@
               <button class="filter active" data-status="all">All validators</button>
               <button class="filter" data-status="current">Current</button>
               <button class="filter" data-status="delinquent">Delinquent</button>
+              <button class="filter" data-status="inactive">Inactive</button>
               <button class="filter" data-status="watchlist">Watchlist</button>
             </div>
             <label class="sort-control">SORT
@@ -76,7 +75,7 @@
           <div class="table-wrap">
             <table>
               <thead><tr><th>VALIDATOR / VOTE ACCOUNT</th><th>WATCH</th><th>STATUS</th><th>INFLATION<br />COMMISSION</th><th>BLOCK REVENUE<br />COMMISSION</th><th>COLLECTOR SETUP</th><th>YOUR<br />SCORE <span class="info" title="Personalized comparison using the commission mix above. It is not a performance or yield rating.">i</span></th><th>ACTIVE STAKE</th></tr></thead>
-              <tbody id="validator-rows"><tr><td colspan="7" class="empty"><span class="loader"></span> Connecting to finalized Solana data…</td></tr></tbody>
+              <tbody id="validator-rows"><tr><td colspan="8" class="empty"><span class="loader"></span> Connecting to finalized Solana data…</td></tr></tbody>
             </table>
           </div>
           <div class="table-footer"><span id="table-count">Showing — validators</span><span class="pagination"><button id="previous-page" disabled>← Previous</button><span id="page-indicator">Page 1</span><button id="next-page" disabled>Next →</button></span><span>Finalized Solana RPC <span class="green-dot"></span></span></div>

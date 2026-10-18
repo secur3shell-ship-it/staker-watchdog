@@ -1,4 +1,6 @@
-export type ValidatorStatus = "current" | "delinquent";
+// "inactive" means the vote account is no longer returned by getVoteAccounts
+// (closed or fully unstaked); its last observed configuration is kept.
+export type ValidatorStatus = "current" | "delinquent" | "inactive";
 
 export interface ValidatorSnapshot {
   votePubkey: string;
@@ -68,9 +70,16 @@ export interface ValidatorRpcEntry {
 }
 
 export interface VoteAccountDetails {
+  /** Layout version (0 = V0_23_5, 1 = V1_14_11, 3 = V3, 4 = V4), not the raw enum tag. */
   version: number;
   inflationCommissionBps: number | null;
   blockRevenueCommissionBps: number | null;
   inflationCollector: string | null;
   blockRevenueCollector: string | null;
+}
+
+export interface VoteStateLookup {
+  details: Map<string, VoteAccountDetails>;
+  /** Vote accounts whose state could not be read this sync, with the reason. */
+  failures: Map<string, string>;
 }

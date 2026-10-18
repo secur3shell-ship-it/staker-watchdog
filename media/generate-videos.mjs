@@ -1,22 +1,20 @@
-import { spawnSync } from "node:child_process";
-import {
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync
-} from "node:fs";
+// Builds the two product videos from real screenshots of the running dashboard.
+//
+//   node media/generate-videos.mjs                 # starts its own server on :3456
+//   BASE_URL=http://127.0.0.1:3000 node media/generate-videos.mjs
+//
+// Requires Google Chrome and ffmpeg (libx264, xfade, zoompan) on PATH.
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const outputDirectory = dirname(fileURLToPath(import.meta.url));
-const logoUrl = pathToFileURL(join(projectRoot, "public", "image.png")).href;
-const temporaryDirectory = mkdtempSync(join(tmpdir(), "staker-watchdog-video-"));
-const width = 1280;
-const height = 720;
-const sceneDuration = 3.8;
-const transitionDuration = 0.65;
+const outputDirectory = join(projectRoot, "media");
+const work = mkdtempSync(join(tmpdir(), "staker-watchdog-video-"));
+const fileUrl = (path) => pathToFileURL(path).href;
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const fps = 30;
 
 const colors = {
@@ -28,344 +26,449 @@ const colors = {
   ink: "#272326",
   secondary: "#554d52",
   muted: "#756b71",
-  pink: "#9b6575",
-  palePink: "#edcbd5",
-  gray: "#626168",
-  green: "#5d6963"
+  ion: "#9b6575"
 };
 
-const productScenes = [
-  {
-    eyebrow: "PRODUCT WALKTHROUGH · 01 / 05",
-    title: ["Know where your", "stake is going."],
-    body: ["A clearer view of validator commissions,", "collectors, and observed changes."],
-    view: "directory"
-  },
-  {
-    eyebrow: "TWO COMMISSION STREAMS · 02 / 05",
-    title: ["See both commission", "streams clearly."],
-    body: ["Compare inflation rewards and block revenue", "side by side, with protocol source context."],
-    view: "commissions"
-  },
-  {
-    eyebrow: "COLLECTOR VISIBILITY · 03 / 05",
-    title: ["Know where each", "commission goes."],
-    body: ["Inspect the configured collector accounts", "for both validator revenue streams."],
-    view: "collectors"
-  },
-  {
-    eyebrow: "OBSERVED CHANGES · 04 / 05",
-    title: ["See what changed", "over time."],
-    body: ["Review observed commission history and", "changes to collectors or validator status."],
-    view: "history"
-  },
-  {
-    eyebrow: "WATCHLIST + API · 05 / 05",
-    title: ["Keep your focus.", "Build on the data."],
-    body: ["Save a browser-local watchlist, tune your", "comparison, or explore the public data API."],
-    view: "api"
-  }
-];
-
-const launchScenes = [
-  {
-    eyebrow: "INTRODUCING",
-    title: ["Staker", "Watchdog."],
-    body: ["Validator intelligence for Solana stakers.", "Read-only monitoring. Clear on-chain context."],
-    view: "launch"
-  },
-  {
-    eyebrow: "A CLEARER COMMISSION PICTURE",
-    title: ["Two commissions.", "One clear view."],
-    body: ["Inflation rewards and block revenue,", "shown separately—not hidden in one number."],
-    view: "commissions"
-  },
-  {
-    eyebrow: "FOLLOW CONFIGURATION CHANGES",
-    title: ["Track the cut.", "Catch changes."],
-    body: ["See collector accounts, observed history,", "and current or delinquent status changes."],
-    view: "history"
-  },
-  {
-    eyebrow: "NOW AVAILABLE",
-    title: ["Validator data", "for Solana."],
-    body: ["Explore the dashboard and public API.", "Built for stakers and staking operators."],
-    view: "launch"
-  }
-];
-
-function escapeXml(value) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-function text(x, y, value, size, color, weight = 400, family = "sans", extra = "") {
-  const font = family === "mono"
-    ? "DM Mono, DejaVu Sans Mono, monospace"
-    : "DM Sans, Arial, sans-serif";
-  return `<text x="${x}" y="${y}" fill="${color}" font-family="${font}" font-size="${size}" font-weight="${weight}" ${extra}>${escapeXml(value)}</text>`;
-}
-
-function rect(x, y, w, h, fill, stroke = colors.lineSoft, radius = 8) {
-  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${radius}" fill="${fill}" stroke="${stroke}"/>`;
-}
-
-function line(x1, y1, x2, y2, color = colors.lineSoft, width = 1) {
-  return `<path d="M${x1} ${y1}H${x2}" stroke="${color}" stroke-width="${width}"/>`;
-}
-
-function logo(x, y, size) {
-  return `<image href="${logoUrl}" x="${x}" y="${y}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid meet"/>`;
-}
-
-function panelHeader(title, detail = "FINALIZED SOLANA DATA") {
-  return [
-    rect(0, 0, 548, 408, colors.surface, colors.line, 12),
-    logo(22, 20, 27),
-    text(60, 37, title, 15, colors.ink, 600),
-    text(525, 36, detail, 9, colors.muted, 500, "mono", 'text-anchor="end"'),
-    line(20, 55, 528)
-  ].join("");
-}
-
-function directoryView() {
-  const entries = [
-    ["Fdk7…jv69Nk", "CURRENT", "5%", "12%", "92.5", "17.5M SOL"],
-    ["HEL1…Gv1e2TU", "CURRENT", "0%", "10%", "95.0", "15.7M SOL"],
-    ["DRpb…okm21hy", "DELINQUENT", "4%", "15%", "90.5", "12.4M SOL"]
-  ];
-  let result = panelHeader("Validator directory");
-  result += rect(22, 73, 225, 33, colors.raised, colors.lineSoft, 5);
-  result += text(36, 94, "Search vote or identity address", 10, colors.muted);
-  result += rect(365, 73, 160, 33, colors.raised, colors.lineSoft, 5);
-  result += text(380, 94, "SORT  ·  ACTIVE STAKE", 9, colors.secondary, 500, "mono");
-  result += rect(22, 122, 504, 38, colors.raised, colors.lineSoft, 4);
-  result += text(38, 146, "VALIDATOR", 9, colors.muted, 500, "mono");
-  result += text(205, 146, "INFLATION", 9, colors.muted, 500, "mono");
-  result += text(295, 146, "BLOCK REV.", 9, colors.muted, 500, "mono");
-  result += text(390, 146, "SCORE", 9, colors.muted, 500, "mono");
-  result += text(470, 146, "STAKE", 9, colors.muted, 500, "mono");
-  entries.forEach((entry, index) => {
-    const y = 160 + index * 67;
-    result += rect(22, y, 504, 66, index % 2 ? colors.surface : "#faf6f7", colors.lineSoft, 0);
-    result += text(38, y + 25, entry[0], 12, colors.ink, 500, "mono");
-    result += text(38, y + 46, entry[1], 9, entry[1] === "CURRENT" ? colors.green : colors.pink, 500, "mono");
-    result += text(205, y + 36, entry[2], 13, colors.ink, 500, "mono");
-    result += text(295, y + 36, entry[3], 13, colors.ink, 500, "mono");
-    result += text(390, y + 36, entry[4], 13, colors.pink, 600, "mono");
-    result += text(470, y + 36, entry[5], 10, colors.secondary, 400, "mono");
-  });
-  result += text(24, 383, "ILLUSTRATIVE PREVIEW · LIVE VALUES UPDATE", 9, colors.muted, 400, "mono");
-  return result;
-}
-
-function commissionsView() {
-  let result = panelHeader("Commission breakdown");
-  result += text(24, 84, "Understand both revenue streams independently.", 12, colors.secondary);
-  result += rect(22, 104, 244, 128, "#faf6f7", colors.lineSoft, 8);
-  result += rect(282, 104, 244, 128, "#faf6f7", colors.lineSoft, 8);
-  result += text(42, 134, "INFLATION REWARDS", 10, colors.muted, 500, "mono");
-  result += text(42, 181, "5.00%", 34, colors.ink, 500, "mono");
-  result += text(42, 210, "VoteState v4 · on-chain", 11, colors.secondary);
-  result += text(302, 134, "BLOCK REVENUE", 10, colors.muted, 500, "mono");
-  result += text(302, 181, "12.00%", 34, colors.ink, 500, "mono");
-  result += text(302, 210, "VoteState v4 · on-chain", 11, colors.secondary);
-  result += rect(22, 248, 504, 110, colors.raised, colors.lineSoft, 8);
-  result += text(42, 278, "COMMISSION COMPARISON", 10, colors.muted, 500, "mono");
-  result += text(42, 323, "91.5", 32, colors.pink, 600, "mono");
-  result += text(124, 322, "/ 100  ·  Equal-weight reference", 12, colors.secondary);
-  result += text(24, 383, "ILLUSTRATIVE VALUES · SCORE IS NOT A YIELD ESTIMATE", 9, colors.muted, 400, "mono");
-  return result;
-}
-
-function collectorsView() {
-  let result = panelHeader("Collector accounts");
-  result += text(24, 84, "See where validator commission streams are directed.", 12, colors.secondary);
-  result += rect(22, 105, 504, 88, colors.surface, colors.lineSoft, 8);
-  result += text(42, 132, "INFLATION REWARDS COLLECTOR", 10, colors.muted, 500, "mono");
-  result += text(42, 160, "7xKX…m4QA", 17, colors.ink, 500, "mono");
-  result += text(42, 180, "Vote account · source shown in profile", 10, colors.secondary);
-  result += rect(22, 207, 504, 88, colors.surface, colors.lineSoft, 8);
-  result += text(42, 234, "BLOCK REVENUE COLLECTOR", 10, colors.muted, 500, "mono");
-  result += text(42, 262, "9pLr…2vHc", 17, colors.ink, 500, "mono");
-  result += text(42, 282, "Validator identity · source shown in profile", 10, colors.secondary);
-  result += rect(22, 310, 504, 48, "#f4eaed", "#e4d1d8", 6);
-  result += text(40, 340, "Legacy accounts are identified with migration-default context.", 11, colors.pink, 500);
-  result += text(24, 383, "SHORTENED ADDRESSES ARE ILLUSTRATIVE", 9, colors.muted, 400, "mono");
-  return result;
-}
-
-function historyView() {
-  let result = panelHeader("Observed validator history");
-  result += text(24, 84, "Configuration and status changes, recorded over time.", 12, colors.secondary);
-  result += rect(22, 100, 504, 150, colors.surface, colors.lineSoft, 8);
-  [0, 1, 2, 3].forEach((i) => {
-    result += line(44, 134 + i * 27, 500, colors.lineSoft);
-  });
-  result += `<polyline points="48,211 150,190 250,199 352,159 470,170" fill="none" stroke="${colors.pink}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`;
-  result += `<polyline points="48,143 150,147 250,145 352,142 470,138" fill="none" stroke="${colors.gray}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>`;
-  result += text(42, 239, "INFLATION COMMISSION", 9, colors.pink, 500, "mono");
-  result += text(214, 239, "BLOCK REVENUE", 9, colors.gray, 500, "mono");
-  result += rect(22, 264, 504, 94, colors.raised, colors.lineSoft, 8);
-  result += text(42, 291, "RECENT OBSERVATION", 9, colors.muted, 500, "mono");
-  result += text(42, 318, "Collector account changed", 13, colors.ink, 500);
-  result += text(42, 341, "Finalized slot · change recorded in history", 10, colors.secondary, 400, "mono");
-  result += text(24, 383, "POLL-OBSERVED HISTORY · NOT A FULL CHAIN EVENT LOG", 9, colors.muted, 400, "mono");
-  return result;
-}
-
-function apiView() {
-  let result = panelHeader("Your data, your workflow");
-  result += text(24, 84, "Watchlist and preferences stay in this browser.", 12, colors.secondary);
-  result += rect(22, 104, 228, 224, colors.surface, colors.lineSoft, 8);
-  result += text(42, 134, "YOUR WATCHLIST", 10, colors.muted, 500, "mono");
-  result += text(42, 169, "Validator · Fdk7…jv69Nk", 11, colors.ink, 500, "mono");
-  result += line(42, 184, 230);
-  result += text(42, 209, "Commission mix", 11, colors.secondary);
-  result += rect(42, 224, 188, 6, colors.line, colors.line, 3);
-  result += rect(42, 224, 94, 6, colors.pink, colors.pink, 3);
-  result += text(42, 254, "Alert preferences", 11, colors.secondary);
-  result += text(42, 280, "Commission · collector · status", 9, colors.muted, 400, "mono");
-  result += text(42, 305, "Saved locally in your browser", 9, colors.green, 500, "mono");
-  result += rect(266, 104, 260, 224, "#242327", "#242327", 8);
-  result += text(286, 134, "GET  /api/validators", 12, colors.palePink, 500, "mono");
-  result += text(286, 170, "{", 14, "#f3e8eb", 400, "mono");
-  result += text(302, 197, '"inflationCommissionBps":', 10, "#ded3d7", 400, "mono");
-  result += text(467, 197, "500,", 10, colors.palePink, 500, "mono");
-  result += text(302, 222, '"blockRevenueCommissionBps":', 9, "#ded3d7", 400, "mono");
-  result += text(472, 222, "1200,", 9, colors.palePink, 500, "mono");
-  result += text(302, 247, '"commissionScore":', 10, "#ded3d7", 400, "mono");
-  result += text(418, 247, "91.5", 10, colors.palePink, 500, "mono");
-  result += text(286, 275, "…", 15, "#f3e8eb", 400, "mono");
-  result += text(286, 305, "PUBLIC DATA · JSON API", 9, "#c2b8bd", 500, "mono");
-  result += text(24, 383, "SAMPLE RESPONSE FIELDS · VALUES ARE ILLUSTRATIVE", 9, colors.muted, 400, "mono");
-  return result;
-}
-
-function launchView() {
-  let result = rect(0, 0, 548, 408, "#f4eaed", "#e4d1d8", 12);
-  result += `<circle cx="274" cy="184" r="105" fill="${colors.surface}" stroke="${colors.line}" stroke-width="2"/>`;
-  result += logo(210, 120, 128);
-  result += text(274, 337, "STAKER WATCHDOG", 17, colors.ink, 600, "sans", 'text-anchor="middle" letter-spacing="2"');
-  result += text(274, 365, "SOLANA VALIDATOR INTELLIGENCE", 10, colors.pink, 500, "mono", 'text-anchor="middle" letter-spacing="1"');
-  result += rect(216, 379, 116, 2, colors.pink, colors.pink, 1);
-  return result;
-}
-
-const views = {
-  directory: directoryView,
-  commissions: commissionsView,
-  collectors: collectorsView,
-  history: historyView,
-  api: apiView,
-  launch: launchView
-};
-
-function renderFrame(scene, index, total, kind) {
-  const titleY = 267;
-  const titleLines = scene.title.map((value, lineIndex) =>
-    text(72, titleY + lineIndex * 62, value, 50, colors.ink, 600)
-  ).join("");
-  const body = scene.body.map((value, lineIndex) =>
-    text(74, 427 + lineIndex * 27, value, 19, colors.secondary, 400)
-  ).join("");
-  const progress = Array.from({ length: total }, (_, i) =>
-    `<circle cx="${1120 + i * 20}" cy="669" r="3" fill="${i === index ? colors.pink : colors.line}"/>`
-  ).join("");
-  const panel = views[scene.view]();
-
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-    <rect width="${width}" height="${height}" fill="${colors.canvas}"/>
-    <circle cx="1115" cy="171" r="290" fill="none" stroke="${colors.lineSoft}" stroke-width="1"/>
-    <circle cx="1115" cy="171" r="250" fill="none" stroke="${colors.lineSoft}" stroke-width="1"/>
-    <rect x="52" y="28" width="1176" height="1" fill="${colors.line}"/>
-    ${logo(72, 47, 34)}
-    ${text(119, 69, "STAKER WATCHDOG", 13, colors.ink, 600, "sans", 'letter-spacing="1.4"')}
-    ${text(322, 69, "SOLANA VALIDATOR INTELLIGENCE", 10, colors.muted, 500, "mono", 'letter-spacing="0.8"')}
-    ${text(72, 155, scene.eyebrow, 11, colors.pink, 600, "mono", 'letter-spacing="1.1"')}
-    ${titleLines}
-    ${body}
-    ${text(74, 521, kind === "product" ? "READ-ONLY · FINALIZED DATA · LOCAL-FIRST PREFERENCES" : "READ-ONLY MONITORING · PUBLIC VALIDATOR DATA API", 10, colors.muted, 500, "mono", 'letter-spacing="0.5"')}
-    <g transform="translate(652 160)">${panel}</g>
-    <rect x="52" y="648" width="1176" height="1" fill="${colors.line}"/>
-    ${text(72, 682, kind === "product" ? "STAKER WATCHDOG  /  PRODUCT WALKTHROUGH" : "STAKER WATCHDOG  /  LAUNCH", 10, colors.muted, 500, "mono", 'letter-spacing="0.7"')}
-    ${progress}
-  </svg>`;
-}
+// ---------------------------------------------------------------- processes
 
 function run(command, args) {
   const result = spawnSync(command, args, { stdio: "inherit" });
   if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`${command} failed with exit code ${result.status}`);
-  }
+  if (result.status !== 0) throw new Error(`${command} exited with ${result.status}`);
 }
 
-function renderPng(svg, filename) {
-  const htmlPath = join(temporaryDirectory, `${filename}.html`);
-  const pngPath = join(temporaryDirectory, `${filename}.png`);
-  writeFileSync(htmlPath, `<!doctype html><meta charset="utf-8"><style>*{box-sizing:border-box}html,body{width:${width}px;height:${height}px;margin:0;overflow:hidden;background:${colors.canvas}}svg{display:block;width:${width}px;height:${height}px}</style>${svg}`);
-  run("google-chrome", [
-    "--headless",
-    "--disable-gpu",
-    "--no-sandbox",
+async function startServer() {
+  if (process.env.BASE_URL) return { base: process.env.BASE_URL.replace(/\/$/, ""), stop() {} };
+  const port = 3456;
+  const startedAt = Date.now();
+  const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+    cwd: projectRoot,
+    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1" },
+    stdio: "ignore"
+  });
+  const base = `http://127.0.0.1:${port}`;
+  // Wait for a fresh sync so the frames show current mainnet data.
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await sleep(1000);
+    try {
+      const health = await (await fetch(`${base}/api/health`)).json();
+      if (Date.parse(health.lastSuccessfulSyncAt) >= startedAt) break;
+      if (attempt === 119 && health.lastSuccessfulSyncAt) {
+        console.warn("No fresh sync yet; using the last stored snapshot");
+      }
+    } catch {
+      // server still starting
+    }
+  }
+  return { base, stop: () => child.kill("SIGTERM") };
+}
+
+async function startChrome() {
+  const port = Number(process.env.CHROME_DEBUG_PORT ?? 9339);
+  const chrome = spawn("google-chrome", [
+    "--headless=new",
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${join(work, "chrome")}`,
+    "--no-first-run",
     "--hide-scrollbars",
     "--allow-file-access-from-files",
-    "--run-all-compositor-stages-before-draw",
-    "--window-size=1280,720",
-    `--user-data-dir=${join(temporaryDirectory, `profile-${filename}`)}`,
-    `--screenshot=${pngPath}`,
-    pathToFileURL(htmlPath).href
-  ]);
-  readFileSync(pngPath);
-  return pngPath;
+    "about:blank"
+  ], { stdio: "ignore" });
+  let targets = [];
+  for (let attempt = 0; attempt < 50 && !targets.some((t) => t.type === "page"); attempt += 1) {
+    await sleep(200);
+    try {
+      targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+    } catch {
+      // not listening yet
+    }
+  }
+  const socket = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
+  await new Promise((done) => socket.addEventListener("open", done));
+  let nextId = 0;
+  const pending = new Map();
+  socket.addEventListener("message", ({ data }) => {
+    const message = JSON.parse(data);
+    if (message.id && pending.has(message.id)) {
+      pending.get(message.id)(message);
+      pending.delete(message.id);
+    }
+  });
+  const send = (method, params = {}) => new Promise((done, fail) => {
+    const id = ++nextId;
+    pending.set(id, (message) => message.error
+      ? fail(new Error(`${method}: ${message.error.message}`))
+      : done(message.result));
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+  const evaluate = async (expression) => {
+    const result = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
+    return result.result.value;
+  };
+  await send("Page.enable");
+  await send("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-reduced-motion", value: "reduce" }]
+  });
+  return {
+    send,
+    evaluate,
+    async open(url, wait = 2500) {
+      await send("Page.navigate", { url });
+      await sleep(wait);
+    },
+    viewport: (width, height, scale, mobile = false) =>
+      send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: scale, mobile }),
+    async capture(path, clip) {
+      const { data } = await send("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: true,
+        clip: clip ? { ...clip, scale: 1 } : undefined
+      });
+      writeFileSync(path, Buffer.from(data, "base64"));
+      return path;
+    },
+    close() {
+      socket.close();
+      chrome.kill();
+    }
+  };
 }
 
-function makeVideo(scenes, kind, outputName) {
-  const frames = scenes.map((scene, index) =>
-    renderPng(renderFrame(scene, index, scenes.length, kind), `${kind}-${index + 1}`)
-  );
-  const args = ["-hide_banner", "-loglevel", "error", "-y"];
-  frames.forEach((frame) => {
-    args.push("-loop", "1", "-framerate", String(fps), "-t", String(sceneDuration), "-i", frame);
-  });
+// ---------------------------------------------------------------- capture
 
-  const filters = frames.map((_, index) =>
-    `[${index}:v]scale=${width}:${height},fps=${fps},setsar=1,format=yuv420p,settb=AVTB[v${index}]`
+async function captureApp(browser, base) {
+  const shots = {};
+  const top = (selector, offset = 0) => browser.evaluate(
+    `document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect().top + scrollY + ${offset}`
   );
+  const region = async (name, selector, offset, width, height) => {
+    const y = selector ? Math.max(0, await top(selector, offset)) : 0;
+    shots[name] = await browser.capture(join(work, `${name}.png`), { x: 0, y, width, height });
+  };
+
+  const validators = (await (await fetch(`${base}/api/validators?limit=1000`)).json()).data;
+  const health = await (await fetch(`${base}/api/health`)).json();
+  const custom = validators.filter((v) =>
+    v.commissionSource === "vote_state_v4" &&
+    (v.inflationCollector !== v.votePubkey || v.blockRevenueCollector !== v.nodePubkey)
+  );
+  if (!validators.length) throw new Error("The API returned no validators to film");
+  // Prefer a validator whose block revenue goes to a third account: the clearest example.
+  const featured = custom.find((v) =>
+    v.blockRevenueCollector !== v.nodePubkey && v.blockRevenueCollector !== v.votePubkey
+  ) ?? custom[0] ?? validators[0];
+  const watched = [featured.votePubkey, validators[0].votePubkey, validators[1]?.votePubkey]
+    .filter(Boolean);
+  const stats = {
+    validators: Number(health.validatorCount),
+    custom: custom.length,
+    delinquent: validators.filter((v) => v.status === "delinquent").length
+  };
+
+  // Desktop at 1280 CSS px, 2x pixels so text survives scaling into frames.
+  await browser.viewport(1280, 720, 2);
+  await browser.open(`${base}/`, 500);
+  await browser.evaluate(`localStorage.setItem("stakerWatchdog.watchlist.v1", ${JSON.stringify(JSON.stringify(watched))})`);
+  await browser.open(`${base}/`, 3500);
+  await region("overview", null, 0, 1280, 720);
+  await region("directory", "#validators", -8, 1280, 720);
+  await region("watch", "#watchlist", -8, 1280, 720);
+  await region("alerts", "#alerts", -8, 1280, 720);
+
+  await browser.open(`${base}/validator/${encodeURIComponent(featured.votePubkey)}`, 3500);
+  await region("profile", "#validator-detail", -8, 1280, 720);
+  await region("history", "#validator-detail .history-block", -16, 1280, 720);
+
+  await browser.viewport(390, 844, 2, true);
+  await browser.open(`${base}/`, 3500);
+  await region("phoneDirectory", "#validator-rows tr", -16, 390, 600);
+  await region("phoneAlerts", "#alerts", -8, 390, 600);
+  await browser.open(`${base}/validator/${encodeURIComponent(featured.votePubkey)}`, 3500);
+  await region("phoneProfile", "#validator-detail .detail-grid", -8, 390, 600);
+
+  return { shots, stats };
+}
+
+// ---------------------------------------------------------------- frames
+
+const fonts = ["400", "500", "600", "700"].map((weight) =>
+  `@font-face{font-family:"DM Sans";font-weight:${weight};src:url("${fileUrl(join(projectRoot, `public/fonts/dm-sans-latin-${weight}-normal.woff2`))}")}`
+).concat(["400", "500"].map((weight) =>
+  `@font-face{font-family:"DM Mono";font-weight:${weight};src:url("${fileUrl(join(projectRoot, `public/fonts/dm-mono-latin-${weight}-normal.woff2`))}")}`
+)).join("");
+const logo = fileUrl(join(projectRoot, "public/image.png"));
+
+const baseCss = `${fonts}
+*{box-sizing:border-box;margin:0}
+html,body{width:1280px;height:720px;overflow:hidden;background:${colors.canvas};color:${colors.ink};font-family:"DM Sans",sans-serif}
+.mono{font-family:"DM Mono",monospace}
+.eyebrow{font:500 12px/16px "DM Mono",monospace;letter-spacing:.12em;color:${colors.ion};text-transform:uppercase;display:flex;align-items:center;gap:10px}
+.eyebrow:before{content:"";width:22px;height:1px;background:${colors.ion}}
+.brand{display:flex;align-items:center;gap:10px;font:600 13px/1 "DM Sans";letter-spacing:.14em}
+.brand img{width:28px;height:28px;object-fit:contain}
+.brand b{font-weight:400;color:${colors.secondary}}
+.shot{border:1px solid ${colors.line};border-radius:10px;overflow:hidden;background:${colors.surface};box-shadow:0 1px 0 ${colors.lineSoft},0 18px 40px rgb(39 35 38 / 10%)}
+.shot img{display:block;width:100%;height:100%;object-fit:cover;object-position:top}
+em{font-style:normal;color:${colors.ion}}`;
+
+const brand = `<div class="brand"><img src="${logo}" alt=""><span>STAKER<b>WATCHDOG</b></span></div>`;
+
+function productFrame(scene, index, total) {
+  const progress = Array.from({ length: total }, (_, i) =>
+    `<i style="background:${i <= index ? colors.ion : colors.line}"></i>`).join("");
+  const visual = scene.phones
+    ? `<div class="phones">${scene.phones.map((src) => `<div class="shot phone"><img src="${fileUrl(src)}" alt=""></div>`).join("")}</div>`
+    : `<div class="shot wide"><img src="${fileUrl(scene.image)}" alt=""></div>`;
+  return `<!doctype html><meta charset="utf-8"><style>${baseCss}
+header{position:absolute;inset:0 0 auto;height:58px;padding:0 50px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid ${colors.line}}
+header .step{font:500 11px/1 "DM Mono";letter-spacing:.1em;color:${colors.muted}}
+.caption{position:absolute;left:50px;right:50px;top:78px;display:grid;grid-template-columns:1fr 440px;align-items:end;gap:40px}
+h1{margin-top:10px;font:600 34px/40px "DM Sans";letter-spacing:-.01em}
+.caption p{font:400 15px/23px "DM Sans";color:${colors.secondary}}
+.wide{position:absolute;left:50px;right:50px;top:186px;height:494px}
+.phones{position:absolute;left:50px;right:50px;top:186px;height:494px;display:flex;justify-content:center;gap:36px}
+.phone{width:342px;height:494px;border-radius:18px}
+footer{position:absolute;left:50px;right:50px;bottom:16px;display:flex;gap:6px}
+footer i{flex:1;height:3px;border-radius:2px}
+</style><body>
+<header>${brand}<span class="step">PRODUCT WALKTHROUGH · ${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}</span></header>
+<div class="caption"><div><div class="eyebrow">${scene.eyebrow}</div><h1>${scene.title}</h1></div><p>${scene.body}</p></div>
+${visual}
+<footer>${progress}</footer>`;
+}
+
+function launchFrame(scene) {
+  if (scene.kind === "card") {
+    return `<!doctype html><meta charset="utf-8"><style>${baseCss}
+body{display:grid;place-items:center;text-align:center}
+.rings{position:absolute;inset:0}
+.rings i{position:absolute;left:50%;top:50%;border:1px solid ${colors.lineSoft};border-radius:50%;transform:translate(-50%,-50%)}
+.mark{width:96px;height:96px;object-fit:contain;margin:0 auto 26px;display:block}
+h1{font:600 64px/70px "DM Sans";letter-spacing:-.02em}
+p{margin-top:18px;font:400 20px/30px "DM Sans";color:${colors.secondary}}
+.eyebrow{justify-content:center;margin-bottom:18px}
+.pills{margin-top:30px;display:flex;gap:10px;justify-content:center}
+.pills span{padding:8px 14px;border:1px solid ${colors.line};border-radius:999px;background:${colors.surface};font:500 12px/1 "DM Mono";letter-spacing:.06em;color:${colors.secondary}}
+</style><body><div class="rings">${[420, 620, 820, 1020].map((size) => `<i style="width:${size}px;height:${size}px"></i>`).join("")}</div>
+<div style="position:relative">${scene.logo ? `<img class="mark" src="${logo}" alt="">` : ""}
+${scene.eyebrow ? `<div class="eyebrow">${scene.eyebrow}</div>` : ""}<h1>${scene.title}</h1>${scene.body ? `<p>${scene.body}</p>` : ""}
+${scene.pills ? `<div class="pills">${scene.pills.map((pill) => `<span>${pill}</span>`).join("")}</div>` : ""}</div>`;
+  }
+  if (scene.kind === "stats") {
+    return `<!doctype html><meta charset="utf-8"><style>${baseCss}
+body{padding:96px 90px}
+h1{margin-top:14px;font:600 46px/54px "DM Sans";letter-spacing:-.015em;max-width:900px}
+.grid{margin-top:56px;display:grid;grid-template-columns:repeat(3,1fr);border:1px solid ${colors.line};border-radius:12px;background:${colors.surface};overflow:hidden}
+.grid div{padding:30px 32px;border-right:1px solid ${colors.line}}
+.grid div:last-child{border-right:0}
+.grid strong{display:block;font:500 54px/1 "DM Mono";color:${colors.ink}}
+.grid div:nth-child(2) strong{color:${colors.ion}}
+.grid span{display:block;margin-top:14px;font:400 16px/23px "DM Sans";color:${colors.secondary}}
+.note{margin-top:22px;font:500 11px/1 "DM Mono";letter-spacing:.08em;color:${colors.muted}}
+</style><body><div class="eyebrow">${scene.eyebrow}</div><h1>${scene.title}</h1>
+<div class="grid">${scene.stats.map(([value, label]) => `<div><strong>${value}</strong><span>${label}</span></div>`).join("")}</div>
+<div class="note">${scene.note}</div>`;
+  }
+  if (scene.kind === "phones") {
+    return `<!doctype html><meta charset="utf-8"><style>${baseCss}
+body{display:grid;grid-template-columns:360px 1fr;align-items:center;padding:0 80px;gap:40px}
+h1{margin-top:14px;font:600 48px/56px "DM Sans";letter-spacing:-.015em}
+p{margin-top:16px;font:400 18px/27px "DM Sans";color:${colors.secondary}}
+.phones{display:flex;gap:20px;justify-content:center;align-items:center}
+.phone{width:214px;height:329px;border-radius:16px}
+.phone:nth-child(2){transform:translateY(-26px)}
+</style><body><div><div class="eyebrow">${scene.eyebrow}</div><h1>${scene.title}</h1><p>${scene.body}</p></div>
+<div class="phones">${scene.phones.map((src) => `<div class="shot phone"><img src="${fileUrl(src)}" alt=""></div>`).join("")}</div>`;
+  }
+  // Full-bleed screenshot with a caption panel.
+  return `<!doctype html><meta charset="utf-8"><style>${baseCss}
+.bleed{position:absolute;inset:44px 44px 0;border:1px solid ${colors.line};border-bottom:0;border-radius:12px 12px 0 0;overflow:hidden;background:${colors.surface}}
+.bleed img{width:100%;height:100%;object-fit:cover;object-position:top}
+.veil{position:absolute;inset:0;background:linear-gradient(180deg,rgb(246 241 242 / 0) 35%,rgb(246 241 242 / 88%) 100%)}
+.panel{position:absolute;left:56px;bottom:52px;max-width:640px;padding:26px 30px;border:1px solid ${colors.line};border-radius:12px;background:${colors.surface};box-shadow:0 22px 50px rgb(39 35 38 / 16%)}
+h1{margin-top:12px;font:600 44px/50px "DM Sans";letter-spacing:-.015em}
+p{margin-top:12px;font:400 17px/25px "DM Sans";color:${colors.secondary}}
+</style><body><div class="bleed"><img src="${fileUrl(scene.image)}" alt=""></div><div class="veil"></div>
+<div class="panel"><div class="eyebrow">${scene.eyebrow}</div><h1>${scene.title}</h1>${scene.body ? `<p>${scene.body}</p>` : ""}</div>`;
+}
+
+async function renderFrames(browser, scenes, render, name, scale) {
+  await browser.viewport(1280, 720, scale);
+  const frames = [];
+  for (const [index, scene] of scenes.entries()) {
+    const html = join(work, `${name}-${index + 1}.html`);
+    writeFileSync(html, render(scene, index, scenes.length));
+    await browser.open(fileUrl(html), 900);
+    await browser.evaluate("document.fonts.ready.then(() => Promise.all([...document.images].map((i) => i.decode().catch(() => {}))))");
+    frames.push(await browser.capture(join(work, `${name}-${index + 1}.png`)));
+  }
+  return frames;
+}
+
+// ---------------------------------------------------------------- encode
+
+function encode(frames, { output, title, sceneDuration, transitions, transitionDuration, kenBurns }) {
+  const args = ["-hide_banner", "-loglevel", "error", "-y"];
+  for (const frame of frames) {
+    args.push("-loop", "1", "-framerate", String(fps), "-t", String(sceneDuration), "-i", frame);
+  }
+  const sceneFrames = Math.round(sceneDuration * fps);
+  const filters = frames.map((_, index) => {
+    // Slow push-in / pull-out on 2x frames; plain scale otherwise.
+    const motion = kenBurns
+      ? `zoompan=z='${index % 2 === 0 ? `1+0.07*on/${sceneFrames}` : `1.07-0.07*on/${sceneFrames}`}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1280x720:fps=${fps}`
+      : `scale=1280:720:flags=lanczos,fps=${fps}`;
+    return `[${index}:v]${motion},setsar=1,format=yuv420p,settb=AVTB[v${index}]`;
+  });
   let previous = "v0";
   for (let index = 1; index < frames.length; index += 1) {
-    const next = `xf${index}`;
-    const offset = (sceneDuration - transitionDuration) * index;
-    filters.push(`[${previous}][v${index}]xfade=transition=fade:duration=${transitionDuration}:offset=${offset}[${next}]`);
-    previous = next;
+    const offset = ((sceneDuration - transitionDuration) * index).toFixed(3);
+    const transition = transitions[(index - 1) % transitions.length];
+    filters.push(`[${previous}][v${index}]xfade=transition=${transition}:duration=${transitionDuration}:offset=${offset}[x${index}]`);
+    previous = `x${index}`;
   }
-  const fullDuration = sceneDuration * frames.length - transitionDuration * (frames.length - 1);
-  const fadeOutDuration = 0.5;
-  filters.push(`[${previous}]fade=t=in:st=0:d=0.35,fade=t=out:st=${(fullDuration - fadeOutDuration).toFixed(2)}:d=${fadeOutDuration}[outv]`);
+  const total = sceneDuration * frames.length - transitionDuration * (frames.length - 1);
+  filters.push(`[${previous}]fade=t=in:st=0:d=0.4,fade=t=out:st=${(total - 0.5).toFixed(2)}:d=0.5[out]`);
   args.push(
     "-filter_complex", filters.join(";"),
-    "-map", "[outv]",
+    "-map", "[out]",
     "-an",
     "-c:v", "libx264",
-    "-preset", "medium",
-    "-crf", "25",
+    "-preset", "slow",
+    "-crf", "27",
+    "-tune", "stillimage",
     "-pix_fmt", "yuv420p",
     "-movflags", "+faststart",
-    "-metadata", `title=${outputName.replaceAll("-", " ")}`,
-    "-metadata", "comment=Silent 1280x720 frame-based video with smooth crossfades",
-    join(outputDirectory, `${outputName}.mp4`)
+    "-metadata", `title=${title}`,
+    "-metadata", "comment=Silent 1280x720 video built from real Staker Watchdog screenshots",
+    join(outputDirectory, output)
   );
   run("ffmpeg", args);
-  console.info(`Created media/${outputName}.mp4`);
+  console.info(`Created media/${output} (${total.toFixed(1)}s)`);
 }
 
+// ---------------------------------------------------------------- scenes
+
+const server = await startServer();
+const browser = await startChrome();
 try {
-  makeVideo(productScenes, "product", "staker-watchdog-product-walkthrough");
-  makeVideo(launchScenes, "launch", "staker-watchdog-launch");
+  const { shots, stats } = await captureApp(browser, server.base);
+  const n = (value) => value.toLocaleString("en");
+
+  const product = [
+    {
+      eyebrow: "Overview",
+      title: "Know where your <em>stake</em> is going.",
+      body: `Live, finalized Solana data for ${n(stats.validators)} validators, refreshed every five minutes.`,
+      image: shots.overview
+    },
+    {
+      eyebrow: "Validator directory",
+      title: "Both commissions, side by side.",
+      body: "Inflation and block-revenue commission read from on-chain VoteState v4, scored with your own weighting.",
+      image: shots.directory
+    },
+    {
+      eyebrow: "Validator profile",
+      title: "See where commission is paid.",
+      body: `Both payout addresses on every profile. ${n(stats.custom)} validators already route theirs to custom accounts.`,
+      image: shots.profile
+    },
+    {
+      eyebrow: "History",
+      title: "What changed, and when.",
+      body: "Every observed commission, collector, or status change on a chart and a timeline.",
+      image: shots.history
+    },
+    {
+      eyebrow: "Watchlist & alerts",
+      title: "Your validators, your alerts.",
+      body: "Star validators, filter the change log, and opt in to desktop notifications. Saved only in your browser.",
+      image: shots.watch
+    },
+    {
+      eyebrow: "Anywhere",
+      title: "On your phone, and in your stack.",
+      body: "A responsive dashboard, a free public JSON API, and signed webhooks for every detected change.",
+      phones: [shots.phoneDirectory, shots.phoneProfile, shots.phoneAlerts]
+    }
+  ];
+
+  const launch = [
+    {
+      kind: "card",
+      logo: true,
+      eyebrow: "Introducing",
+      title: "Staker Watchdog",
+      body: "Validator intelligence for Solana stakers."
+    },
+    {
+      kind: "bleed",
+      eyebrow: "Two commissions. One view.",
+      title: "Stop guessing what your validator keeps.",
+      body: "Inflation and block-revenue commission, straight from the chain.",
+      image: shots.directory
+    },
+    {
+      kind: "stats",
+      eyebrow: "Live on mainnet",
+      title: "The payout details behind every validator.",
+      stats: [
+        [n(stats.validators), "validators tracked on finalized data"],
+        [n(stats.custom), "already route commission to custom collector accounts"],
+        [n(stats.delinquent), "delinquent right now, flagged the moment status changes"]
+      ],
+      note: `FIGURES FROM THE LIVE SERVICE · ${new Date().toISOString().slice(0, 10)}`
+    },
+    {
+      kind: "bleed",
+      eyebrow: "Every validator, explained",
+      title: "Follow the money.",
+      body: "Commission rates, collector accounts, and history on one profile.",
+      image: shots.profile
+    },
+    {
+      kind: "bleed",
+      eyebrow: "Change watch",
+      title: "Catch changes before they catch you.",
+      body: "Live updates in the browser, signed webhooks for your systems.",
+      image: shots.alerts
+    },
+    {
+      kind: "phones",
+      eyebrow: "Wherever you are",
+      title: "Built for your pocket, too.",
+      body: "Every field, every validator, on any screen.",
+      phones: [shots.phoneDirectory, shots.phoneProfile, shots.phoneAlerts]
+    },
+    {
+      kind: "card",
+      logo: true,
+      eyebrow: "Live now",
+      title: "Know where your <em>stake</em> is going.",
+      pills: ["DASHBOARD", "WATCHLISTS", "SIGNED WEBHOOKS", "FREE PUBLIC API"]
+    }
+  ];
+
+  encode(await renderFrames(browser, product, productFrame, "product", 1), {
+    output: "staker-watchdog-product-walkthrough.mp4",
+    title: "Staker Watchdog product walkthrough",
+    sceneDuration: 3.6,
+    transitionDuration: 0.6,
+    transitions: ["fade"],
+    kenBurns: false
+  });
+  encode(await renderFrames(browser, launch, launchFrame, "launch", 2), {
+    output: "staker-watchdog-launch.mp4",
+    title: "Staker Watchdog launch",
+    sceneDuration: 3.2,
+    transitionDuration: 0.7,
+    transitions: ["fadeblack", "smoothleft", "circleopen", "smoothup", "slideleft", "fadeblack"],
+    kenBurns: true
+  });
 } finally {
-  rmSync(temporaryDirectory, { recursive: true, force: true });
+  browser.close();
+  server.stop();
+  rmSync(work, { recursive: true, force: true });
 }

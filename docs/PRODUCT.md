@@ -26,13 +26,14 @@ The public API is intended to remain usable without payment. The institutional t
 The web dashboard presents a searchable directory with:
 
 - Vote-account address and validator identity (shortened for display; full values are available in API data and address tooltips where used).
-- Current or delinquent state as returned by finalized `getVoteAccounts`.
+- Current or delinquent state as returned by finalized `getVoteAccounts`, or `inactive` once a validator is no longer returned there (closed or fully unstaked).
 - Inflation commission and block-revenue commission, shown independently.
 - Separate inflation and block-revenue collector addresses.
 - Active delegated stake, kept precise in the API as lamports represented by a decimal string.
 - A personalized commission-only comparison score using the user's chosen reward mix.
-- Search by vote account or validator identity; filters for current/delinquent validators or the local watchlist; sorting by stake, commission score, either commission, or status; and 25-row pages.
+- Search by vote account or validator identity; filters for current, delinquent, or inactive validators or the local watchlist (inactive validators are hidden from "All validators"); sorting by stake, commission score, either commission, or status; and 25-row pages.
 - A bookmarkable validator profile at `/validator/:votePubkey` with full addresses, state-source disclosure, collector accounts, status, stake, and recent change history.
+- On phones (600px and narrower), each validator is a labelled card so every field is visible without horizontal scrolling.
 
 The directory is sourced from the service's local latest snapshot. It is not a direct browser-to-RPC query.
 
@@ -45,9 +46,9 @@ After the first successful poll establishes the baseline, the monitor records ch
 3. Inflation-rewards collector.
 4. Block-revenue collector.
 
-The change log provides before/after values and the observation time. If configured, an operator-owned webhook gets a JSON POST for each detected change.
+The change log provides before/after values and the observation time. If configured, an operator-owned webhook gets a JSON POST for each detected change, signed with HMAC-SHA256 when `ALERT_WEBHOOK_SECRET` is set. Deliveries arrive in order and are retried until the receiver accepts them, so a receiver outage delays alerts rather than losing them. [INTEGRATIONS.md](./INTEGRATIONS.md) explains how to build a receiver and when to use the webhook, live events, notifications, or the API.
 
-There are no alerts on the first-ever observation: the service cannot truthfully call an initial value a change. Current/delinquent transitions are also recorded as alerts; stake, identity, score, and source-version changes alone do not create change alerts (identity/source transitions are available in history).
+There are no alerts on the first-ever observation: the service cannot truthfully call an initial value a change. Current/delinquent/inactive transitions are also recorded as alerts; stake, identity, score, and source-version changes alone do not create change alerts (identity/source transitions are available in history).
 
 ### JSON API
 
@@ -69,7 +70,7 @@ The commission-mix slider lets the user choose the assumed share of value assign
 
 ### Live dashboard updates
 
-The page opens a server-sent events connection. After a successful sync, the service emits the observed slot, epoch, validator count, timestamp, and alert events; the open page refreshes its API data immediately. EventSource reconnects automatically after interruption. A one-minute refresh remains as a fallback and health refresh.
+The page opens a server-sent events connection. After a successful sync, the service emits the observed slot, epoch, validator count, timestamp, and alert events; the open page refreshes its API data immediately. EventSource reconnects automatically after interruption, and the page polls every two minutes only while the stream is down. Slider, watchlist-star, and alert-category changes redraw already-loaded data rather than spending API requests. If the free request limit is reached, the page shows "RATE LIMITED" with the retry time instead of claiming the service is offline.
 
 ## Reading legacy and v4 data
 
@@ -77,11 +78,11 @@ The page opens a server-sent events connection. After a successful sync, the ser
 
 - `vote_state_v4`: dual commission rates and collectors were read from the account's v4 state.
 - `legacy_migration_default`: the vote account is on a legacy state version; fields are derived using the accepted Vote Account v4 migration defaults. This is not a claim the validator separately set each new field.
-- `null`: no supported state interpretation was available; unknown versions are rejected during sync rather than silently invented.
+- `null`: no supported state interpretation was available (for example a new validator whose account could not be read); values are never silently invented. If an already-known validator's account becomes unreadable, its last decoded values are kept until it can be read again.
 
 For the legacy path, the inflation commission comes from the RPC vote-account commission, block-revenue commission is the protocol migration default of 10,000 bps, inflation collector defaults to the vote-account address, and block-revenue collector defaults to the validator identity.
 
-The dashboard labels these as legacy commission and protocol migration defaults. When validators move to v4, new explicit values are decoded from their vote-account state.
+The dashboard labels these as legacy commission and protocol migration defaults. When validators move to v4, new explicit values are decoded from their vote-account state. As of 2026-10-18 every observed mainnet vote account is already V4; 28 use a custom block-revenue collector and 2 a custom inflation collector, while all block-revenue commissions are still 100%.
 
 ## Commission score
 
@@ -115,7 +116,7 @@ There is no Solana program, wallet connection, staking flow, key custody, or tra
 - Browser-local watchlists and notification preferences do not sync between browsers/devices and are not managed user accounts.
 - Desktop notifications require browser permission and an open page; there is no push service or email delivery.
 - Validator display labels are still addresses, not curated names; adding names requires a validated metadata source and attribution policy.
-- Optional webhook delivery is best-effort. A failed delivery is logged; there is no retry queue in this MVP.
-- API keys and rate counters are in-memory configuration/state. Keys are not tenant records and counters reset on restart.
+- Webhook delivery is at least once (receivers should deduplicate on the delivery ID). Receivers that permanently reject an alert with a `4xx` status skip that alert.
+- API keys and rate counters are in-memory configuration/state. Keys are not tenant records and counters reset on restart. Deployments behind a proxy must set `TRUST_PROXY` for per-client limits.
 - It is not yet an HA or horizontally scaled service; SQLite is a local single-instance store.
 - Curated validator names/metadata, performance analytics, stake-delegator-specific yield estimates, server-managed profiles/preferences, and commercial billing remain outside this first release.

@@ -1,5 +1,5 @@
 import { identifyVoteState, VOTE_PROGRAM_ID } from "./vote-account.js";
-import type { ValidatorRpcEntry, VoteAccountDetails } from "./types.js";
+import type { ValidatorRpcEntry, VoteAccountDetails, VoteStateLookup } from "./types.js";
 import JSONbig from "json-bigint";
 
 interface RpcResponse<T> {
@@ -68,10 +68,14 @@ export class SolanaRpc {
     return epoch;
   }
 
-  async getVoteStateDetails(
-    votePubkeys: string[]
-  ): Promise<Map<string, VoteAccountDetails>> {
+  /**
+   * Reads vote-state details in batches. A malformed RPC envelope fails the
+   * whole call, but a single unreadable account (missing, wrong owner, unknown
+   * layout) is reported in `failures` so it cannot halt monitoring of the rest.
+   */
+  async getVoteStateDetails(votePubkeys: string[]): Promise<VoteStateLookup> {
     const details = new Map<string, VoteAccountDetails>();
+    const failures = new Map<string, string>();
     for (let offset = 0; offset < votePubkeys.length; offset += 100) {
       const batch = votePubkeys.slice(offset, offset + 100);
       const result = await this.request<RpcAccountBatch>(
@@ -83,24 +87,32 @@ export class SolanaRpc {
       }
 
       result.value.forEach((account, index) => {
-        if (!account) return;
         const votePubkey = batch[index];
         if (!votePubkey) return;
+        if (!account) {
+          failures.set(votePubkey, "account not found");
+          return;
+        }
         if (account.owner !== VOTE_PROGRAM_ID) {
-          throw new Error(`Vote account ${votePubkey} is not owned by the vote program`);
+          failures.set(votePubkey, `not owned by the vote program (owner ${account.owner})`);
+          return;
         }
         if (
           !Array.isArray(account.data) ||
           account.data[1] !== "base64" ||
           typeof account.data[0] !== "string"
         ) {
-          throw new Error(`RPC returned malformed account data for ${votePubkey}`);
+          failures.set(votePubkey, "malformed account data");
+          return;
         }
-        const parsed = identifyVoteState(Buffer.from(account.data[0], "base64"));
-        details.set(votePubkey, parsed);
+        try {
+          details.set(votePubkey, identifyVoteState(Buffer.from(account.data[0], "base64")));
+        } catch (error) {
+          failures.set(votePubkey, error instanceof Error ? error.message : String(error));
+        }
       });
     }
-    return details;
+    return { details, failures };
   }
 
   private async request<T>(method: string, params: unknown[]): Promise<T> {
